@@ -55,7 +55,7 @@ def test_cpuid(test_microvm_with_api, network_config, num_vcpus, htt):
     """
     vm = test_microvm_with_api
     vm.spawn()
-    vm.basic_config(vcpu_count=num_vcpus, ht_enabled=htt)
+    vm.basic_config(vcpu_count=num_vcpus, smt=htt)
     _tap, _, _ = vm.ssh_network_config(network_config, '1')
     vm.start()
     _check_cpuid_x86(vm, num_vcpus, "true" if num_vcpus > 1 else "false")
@@ -98,7 +98,7 @@ def test_brand_string(test_microvm_with_api, network_config):
 
     @type: functional
     """
-    cif = open('/proc/cpuinfo', 'r')
+    cif = open('/proc/cpuinfo', 'r', encoding='utf-8')
     host_brand_string = None
     while True:
         line = cif.readline()
@@ -165,7 +165,6 @@ def test_cpu_template(test_microvm_with_api, network_config, cpu_template):
     response = test_microvm.machine_cfg.put(
         vcpu_count=1,
         mem_size_mib=256,
-        ht_enabled=False,
         cpu_template=cpu_template,
     )
     assert test_microvm.api_session.is_status_no_content(response.status_code)
@@ -192,8 +191,8 @@ def check_masked_features(test_microvm, cpu_template):
                                     "psn", "ds", "acpi", "tm", "ss", "pbe",
                                     "fpdp", "rdt_m", "rdt_a", "mpx", "avx512f",
                                     "intel_pt",
-                                    "avx512_vpopcntdq",
-                                    "3dnowprefetch", "pdpe1gb"]
+                                    "avx512_vpopcntdq", "avx512_vnni",
+                                    "3dnowprefetch", "pdpe1gb", "vmx", "umip"]
 
     common_masked_features_cpuid = {"SGX": "false", "HLE": "false",
                                     "RTM": "false", "RDSEED": "false",
@@ -208,7 +207,8 @@ def check_masked_features(test_microvm, cpu_template):
                                     "AVX512_4VNNIW": "false",
                                     "AVX512_4FMAPS": "false",
                                     "XSAVEC": "false", "XGETBV": "false",
-                                    "XSAVES": "false"}
+                                    "XSAVES": "false", "UMIP": "false",
+                                    "VMX": "false"}
 
     # These are all discoverable by cpuid -1.
     c3_masked_features = {"FMA": "false", "MOVBE": "false", "BMI": "false",

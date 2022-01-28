@@ -253,6 +253,11 @@ pub struct Vmm {
 }
 
 impl Vmm {
+    /// Gets Vmm version.
+    pub fn version(&self) -> String {
+        self.instance_info.vmm_version.clone()
+    }
+
     /// Gets Vmm instance info.
     pub fn instance_info(&self) -> InstanceInfo {
         self.instance_info.clone()
@@ -532,7 +537,7 @@ impl Vmm {
             .with_virtio_device_with_id(TYPE_BLOCK, drive_id, |block: &mut Block| {
                 block
                     .update_disk_image(path_on_host)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| format!("{:?}", e))
             })
             .map_err(Error::DeviceManager)
     }

@@ -6,76 +6,23 @@
 // found in the THIRD-PARTY file.
 
 use std::convert::From;
-use std::io::{self, Seek, SeekFrom, Write};
 use std::result;
 
-use logger::{IncMetric, METRICS};
-use rate_limiter::{RateLimiter, TokenType};
+use logger::{error, IncMetric, METRICS};
 use virtio_gen::virtio_blk::*;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
 
 use super::super::DescriptorChain;
-use super::device::DiskProperties;
-use super::{Error, SECTOR_SHIFT, SECTOR_SIZE};
+use super::{io as block_io, Error, SECTOR_SHIFT};
+use crate::virtio::block::device::DiskProperties;
+use crate::virtio::SECTOR_SIZE;
+use rate_limiter::{RateLimiter, TokenType};
 
 #[derive(Debug)]
-pub enum IoErrStatus {
-    BadRequest(Error),
-    Flush(io::Error),
-    // Read(num_used_bytes, GuestMemoryError)
-    Read(u32, GuestMemoryError),
-    Seek(io::Error),
-    SyncAll(io::Error),
-    Write(GuestMemoryError),
-}
-
-#[derive(Debug)]
-pub enum ErrStatus {
-    IoErr(IoErrStatus),
-    Unsupported(u32),
-}
-
-#[derive(Debug)]
-pub enum Status {
-    // Ok(num_used_bytes)
-    Ok(u32),
-    Err(ErrStatus),
-}
-
-impl Status {
-    pub fn from_result(result: result::Result<u32, ErrStatus>) -> Status {
-        match result {
-            Ok(status) => Status::Ok(status),
-            Err(status) => Status::Err(status),
-        }
-    }
-
-    pub fn virtio_blk_status(&self) -> u8 {
-        let virtio_blk_status = match self {
-            Status::Ok(_) => VIRTIO_BLK_S_OK,
-            Status::Err(status) => match status {
-                ErrStatus::IoErr(_) => VIRTIO_BLK_S_IOERR,
-                ErrStatus::Unsupported(_) => VIRTIO_BLK_S_UNSUPP,
-            },
-        };
-
-        virtio_blk_status as u8
-    }
-
-    pub fn num_used_bytes(&self) -> u32 {
-        let num_used_bytes = match self {
-            Status::Ok(num_used_bytes) => *num_used_bytes,
-            Status::Err(status) => match status {
-                ErrStatus::IoErr(io_err) => match io_err {
-                    IoErrStatus::Read(num_used_bytes, _) => *num_used_bytes,
-                    _ => 0,
-                },
-                ErrStatus::Unsupported(_) => 0,
-            },
-        };
-        // account for the status byte
-        num_used_bytes + 1
-    }
+pub enum IoErr {
+    GetId(GuestMemoryError),
+    PartialTransfer { completed: u32, expected: u32 },
+    FileEngine(block_io::Error),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,13 +46,126 @@ impl From<u32> for RequestType {
     }
 }
 
-#[cfg_attr(test, derive(Debug, PartialEq))]
-pub struct Request {
-    pub request_type: RequestType,
-    pub data_len: u32,
-    pub status_addr: GuestAddress,
-    sector: u64,
-    data_addr: GuestAddress,
+pub enum ProcessingResult {
+    Submitted,
+    Throttled,
+    Executed(FinishedRequest),
+}
+
+pub struct FinishedRequest {
+    pub num_bytes_to_mem: u32,
+    pub desc_idx: u16,
+}
+
+enum Status {
+    Ok { num_bytes_to_mem: u32 },
+    IoErr { num_bytes_to_mem: u32, err: IoErr },
+    Unsupported { op: u32 },
+}
+
+impl Status {
+    fn from_data(data_len: u32, transferred_data_len: u32, data_to_mem: bool) -> Status {
+        let num_bytes_to_mem = match data_to_mem {
+            true => transferred_data_len,
+            false => 0,
+        };
+
+        match transferred_data_len == data_len {
+            true => Status::Ok { num_bytes_to_mem },
+            false => Status::IoErr {
+                num_bytes_to_mem,
+                err: IoErr::PartialTransfer {
+                    completed: transferred_data_len,
+                    expected: data_len,
+                },
+            },
+        }
+    }
+}
+
+pub struct PendingRequest {
+    r#type: RequestType,
+    data_len: u32,
+    status_addr: GuestAddress,
+    desc_idx: u16,
+}
+
+impl PendingRequest {
+    fn write_status_and_finish(self, status: &Status, mem: &GuestMemoryMmap) -> FinishedRequest {
+        let (num_bytes_to_mem, status_code) = match status {
+            Status::Ok { num_bytes_to_mem } => (*num_bytes_to_mem, VIRTIO_BLK_S_OK),
+            Status::IoErr {
+                num_bytes_to_mem,
+                err,
+            } => {
+                METRICS.block.invalid_reqs_count.inc();
+                error!(
+                    "Failed to execute {:?} virtio block request: {:?}",
+                    self.r#type, err
+                );
+                (*num_bytes_to_mem, VIRTIO_BLK_S_IOERR)
+            }
+            Status::Unsupported { op } => {
+                METRICS.block.invalid_reqs_count.inc();
+                error!("Received unsupported virtio block request: {}", op);
+                (0, VIRTIO_BLK_S_UNSUPP)
+            }
+        };
+
+        let num_bytes_to_mem = mem
+            .write_obj(status_code as u8, self.status_addr)
+            .map(|_| {
+                // Account for the status byte
+                num_bytes_to_mem + 1
+            })
+            .unwrap_or_else(|e| {
+                error!("Failed to write virtio block status: {:?}", e);
+                // If we can't write the status, discard the virtio descriptor
+                0
+            });
+
+        FinishedRequest {
+            num_bytes_to_mem,
+            desc_idx: self.desc_idx,
+        }
+    }
+
+    pub fn finish(self, mem: &GuestMemoryMmap, res: Result<u32, IoErr>) -> FinishedRequest {
+        let status = match (res, self.r#type) {
+            (Ok(transferred_data_len), RequestType::In) => {
+                let status = Status::from_data(self.data_len, transferred_data_len, true);
+                METRICS.block.read_bytes.add(transferred_data_len as usize);
+                if let Status::Ok { .. } = status {
+                    METRICS.block.read_count.inc();
+                }
+                status
+            }
+            (Ok(transferred_data_len), RequestType::Out) => {
+                let status = Status::from_data(self.data_len, transferred_data_len, false);
+                METRICS.block.write_bytes.add(transferred_data_len as usize);
+                if let Status::Ok { .. } = status {
+                    METRICS.block.write_count.inc();
+                }
+                status
+            }
+            (Ok(_), RequestType::Flush) => {
+                METRICS.block.flush_count.inc();
+                Status::Ok {
+                    num_bytes_to_mem: 0,
+                }
+            }
+            (Ok(transferred_data_len), RequestType::GetDeviceID) => {
+                Status::from_data(self.data_len, transferred_data_len, true)
+            }
+            (_, RequestType::Unsupported(op)) => Status::Unsupported { op },
+            (Err(err), _) => Status::IoErr {
+                num_bytes_to_mem: 0,
+                err,
+            },
+        };
+
+        self.write_status_and_finish(&status, mem)
+    }
 }
 
 /// The request header represents the mandatory fields of each block device request.
@@ -150,6 +210,15 @@ impl RequestHeader {
     }
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub struct Request {
+    pub r#type: RequestType,
+    pub data_len: u32,
+    pub status_addr: GuestAddress,
+    sector: u64,
+    data_addr: GuestAddress,
+}
+
 impl Request {
     pub fn parse(
         avail_desc: &DescriptorChain,
@@ -163,7 +232,7 @@ impl Request {
 
         let request_header = RequestHeader::read_from(mem, avail_desc.addr)?;
         let mut req = Request {
-            request_type: RequestType::from(request_header.request_type),
+            r#type: RequestType::from(request_header.request_type),
             sector: request_header.sector,
             data_addr: GuestAddress(0),
             data_len: 0,
@@ -179,7 +248,7 @@ impl Request {
         if !desc.has_next() {
             status_desc = desc;
             // Only flush requests are allowed to skip the data descriptor.
-            if req.request_type != RequestType::Flush {
+            if req.r#type != RequestType::Flush {
                 return Err(Error::DescriptorChainTooShort);
             }
         } else {
@@ -188,13 +257,13 @@ impl Request {
                 .next_descriptor()
                 .ok_or(Error::DescriptorChainTooShort)?;
 
-            if data_desc.is_write_only() && req.request_type == RequestType::Out {
+            if data_desc.is_write_only() && req.r#type == RequestType::Out {
                 return Err(Error::UnexpectedWriteOnlyDescriptor);
             }
-            if !data_desc.is_write_only() && req.request_type == RequestType::In {
+            if !data_desc.is_write_only() && req.r#type == RequestType::In {
                 return Err(Error::UnexpectedReadOnlyDescriptor);
             }
-            if !data_desc.is_write_only() && req.request_type == RequestType::GetDeviceID {
+            if !data_desc.is_write_only() && req.r#type == RequestType::GetDeviceID {
                 return Err(Error::UnexpectedReadOnlyDescriptor);
             }
 
@@ -203,7 +272,7 @@ impl Request {
         }
 
         // check request validity
-        match req.request_type {
+        match req.r#type {
             RequestType::In | RequestType::Out => {
                 // Check that the data length is a multiple of 512 as specified in the virtio standard.
                 if u64::from(req.data_len) % SECTOR_SIZE != 0 {
@@ -246,7 +315,7 @@ impl Request {
             return true;
         }
         // Exercise the rate limiter only if this request is of data transfer type.
-        if self.request_type == RequestType::In || self.request_type == RequestType::Out {
+        if self.r#type == RequestType::In || self.r#type == RequestType::Out {
             // If limiter.consume() fails it means there is no more TokenType::Bytes
             // budget and rate limiting is in effect.
             if !rate_limiter.consume(u64::from(self.data_len), TokenType::Bytes) {
@@ -259,69 +328,68 @@ impl Request {
         false
     }
 
-    fn execute_seek(&self, disk: &mut DiskProperties) -> result::Result<(), ErrStatus> {
-        disk.file_mut()
-            .seek(SeekFrom::Start(self.sector << SECTOR_SHIFT))
-            .map(|_| ())
-            .map_err(|e| ErrStatus::IoErr(IoErrStatus::Seek(e)))
+    fn offset(&self) -> u64 {
+        self.sector << SECTOR_SHIFT
     }
 
-    pub(crate) fn execute(
-        &self,
+    fn to_pending_request(&self, desc_idx: u16) -> PendingRequest {
+        PendingRequest {
+            r#type: self.r#type,
+            data_len: self.data_len,
+            status_addr: self.status_addr,
+            desc_idx,
+        }
+    }
+
+    pub(crate) fn process(
+        self,
         disk: &mut DiskProperties,
+        desc_idx: u16,
         mem: &GuestMemoryMmap,
-    ) -> result::Result<u32, ErrStatus> {
-        match self.request_type {
-            RequestType::In => {
-                self.execute_seek(disk)?;
-                mem.read_exact_from(self.data_addr, disk.file_mut(), self.data_len as usize)
-                    .map(|_| {
-                        METRICS.block.read_bytes.add(self.data_len as usize);
-                        METRICS.block.read_count.inc();
-                        self.data_len
-                    })
-                    .map_err(|e| {
-                        let mut num_used_bytes = self.data_len;
-                        if let GuestMemoryError::PartialBuffer { completed, .. } = e {
-                            METRICS.block.read_bytes.add(completed);
-                            // It's safe to cast to u32 since completed < data_len.
-                            num_used_bytes = completed as u32;
-                        }
-                        ErrStatus::IoErr(IoErrStatus::Read(num_used_bytes, e))
-                    })
+    ) -> ProcessingResult {
+        let pending = self.to_pending_request(desc_idx);
+        let res = match self.r#type {
+            RequestType::In => disk.file_engine_mut().read(
+                self.offset(),
+                mem,
+                self.data_addr,
+                self.data_len,
+                pending,
+            ),
+            RequestType::Out => disk.file_engine_mut().write(
+                self.offset(),
+                mem,
+                self.data_addr,
+                self.data_len,
+                pending,
+            ),
+            RequestType::Flush => disk.file_engine_mut().flush(pending),
+            RequestType::GetDeviceID => {
+                let res = mem
+                    .write_slice(disk.image_id(), self.data_addr)
+                    .map(|_| VIRTIO_BLK_ID_BYTES)
+                    .map_err(IoErr::GetId);
+                return ProcessingResult::Executed(pending.finish(mem, res));
             }
-            RequestType::Out => {
-                self.execute_seek(disk)?;
-                mem.write_all_to(self.data_addr, disk.file_mut(), self.data_len as usize)
-                    .map(|_| {
-                        METRICS.block.write_bytes.add(self.data_len as usize);
-                        METRICS.block.write_count.inc();
-                        0
-                    })
-                    .map_err(|e| {
-                        if let GuestMemoryError::PartialBuffer { completed, .. } = e {
-                            METRICS.block.write_bytes.add(completed);
-                        }
-                        ErrStatus::IoErr(IoErrStatus::Write(e))
-                    })
+            RequestType::Unsupported(_) => {
+                return ProcessingResult::Executed(pending.finish(mem, Ok(0)));
             }
-            RequestType::Flush => {
-                // flush() first to force any cached data out.
-                disk.file_mut()
-                    .flush()
-                    .map_err(|e| ErrStatus::IoErr(IoErrStatus::Flush(e)))?;
-                // Sync data out to physical media on host.
-                disk.file_mut()
-                    .sync_all()
-                    .map_err(|e| ErrStatus::IoErr(IoErrStatus::SyncAll(e)))?;
-                METRICS.block.flush_count.inc();
-                Ok(0)
+        };
+
+        match res {
+            Ok(block_io::FileEngineOk::Submitted) => ProcessingResult::Submitted,
+            Ok(block_io::FileEngineOk::Executed(res)) => {
+                ProcessingResult::Executed(res.user_data.finish(mem, Ok(res.count)))
             }
-            RequestType::GetDeviceID => mem
-                .write_slice(disk.image_id(), self.data_addr)
-                .map(|_| VIRTIO_BLK_ID_BYTES)
-                .map_err(|e| ErrStatus::IoErr(IoErrStatus::Write(e))),
-            RequestType::Unsupported(op) => Err(ErrStatus::Unsupported(op)),
+            Err(e) => {
+                if e.error.is_throttling_err() {
+                    ProcessingResult::Throttled
+                } else {
+                    ProcessingResult::Executed(
+                        e.user_data.finish(mem, Err(IoErr::FileEngine(e.error))),
+                    )
+                }
+            }
         }
     }
 }
@@ -375,74 +443,6 @@ mod tests {
             RequestType::GetDeviceID
         );
         assert_eq!(RequestType::from(42), RequestType::Unsupported(42));
-    }
-
-    #[test]
-    fn test_status() {
-        {
-            let status = Status::from_result(Ok(10));
-            assert_eq!(status.virtio_blk_status(), VIRTIO_BLK_S_OK as u8);
-            assert_eq!(status.num_used_bytes(), 11);
-        }
-
-        {
-            let status = Status::from_result(Err(ErrStatus::IoErr(IoErrStatus::BadRequest(
-                Error::InvalidOffset,
-            ))));
-            assert_eq!(status.virtio_blk_status(), VIRTIO_BLK_S_IOERR as u8);
-            assert_eq!(status.num_used_bytes(), 1);
-        }
-
-        {
-            let status = Status::from_result(Err(ErrStatus::IoErr(IoErrStatus::Flush(
-                io::Error::from_raw_os_error(42),
-            ))));
-            assert_eq!(status.virtio_blk_status(), VIRTIO_BLK_S_IOERR as u8);
-            assert_eq!(status.num_used_bytes(), 1);
-        }
-
-        {
-            let status = Status::from_result(Err(ErrStatus::IoErr(IoErrStatus::Read(
-                0,
-                GuestMemoryError::InvalidBackendAddress,
-            ))));
-            assert_eq!(status.virtio_blk_status(), VIRTIO_BLK_S_IOERR as u8);
-            assert_eq!(status.num_used_bytes(), 1);
-        }
-
-        {
-            let status = Status::from_result(Err(ErrStatus::IoErr(IoErrStatus::Read(
-                10,
-                GuestMemoryError::PartialBuffer {
-                    expected: 10,
-                    completed: 20,
-                },
-            ))));
-            assert_eq!(status.virtio_blk_status(), VIRTIO_BLK_S_IOERR as u8);
-            assert_eq!(status.num_used_bytes(), 11);
-        }
-
-        {
-            let status = Status::from_result(Err(ErrStatus::IoErr(IoErrStatus::Seek(
-                io::Error::from_raw_os_error(42),
-            ))));
-            assert_eq!(status.virtio_blk_status(), VIRTIO_BLK_S_IOERR as u8);
-            assert_eq!(status.num_used_bytes(), 1);
-        }
-
-        {
-            let status = Status::from_result(Err(ErrStatus::IoErr(IoErrStatus::Write(
-                GuestMemoryError::InvalidBackendAddress,
-            ))));
-            assert_eq!(status.virtio_blk_status(), VIRTIO_BLK_S_IOERR as u8);
-            assert_eq!(status.num_used_bytes(), 1);
-        }
-
-        {
-            let status = Status::from_result(Err(ErrStatus::Unsupported(0)));
-            assert_eq!(status.virtio_blk_status(), VIRTIO_BLK_S_UNSUPP as u8);
-            assert_eq!(status.num_used_bytes(), 1);
-        }
     }
 
     struct RequestVirtQueue<'a> {
@@ -520,10 +520,7 @@ mod tests {
             let mut q = self.vq.create_queue();
             let request =
                 Request::parse(&q.pop(self.mem).unwrap(), self.mem, NUM_DISK_SECTORS).unwrap();
-            assert_eq!(
-                request.request_type,
-                RequestType::from(self.hdr().request_type)
-            );
+            assert_eq!(request.r#type, RequestType::from(self.hdr().request_type));
             assert_eq!(request.sector, self.hdr().sector);
 
             if check_data {
@@ -848,7 +845,7 @@ mod tests {
         let sectors_len = u64::from(valid_data_len) / SECTOR_SIZE;
         // Craft a random request with the randomized parameters.
         let mut request = Request {
-            request_type,
+            r#type: request_type,
             data_len: valid_data_len,
             status_addr,
             sector: sector & (NUM_DISK_SECTORS - sectors_len),
@@ -863,7 +860,7 @@ mod tests {
             request_header,
         );
         // Flush requests have no data desc.
-        if request.request_type == RequestType::Flush {
+        if request.r#type == RequestType::Flush {
             request.data_addr = GuestAddress(0);
             request.data_len = 0;
             rq.mut_hdr_desc()
@@ -873,7 +870,7 @@ mod tests {
             rq.set_data_desc(
                 request.data_addr.0,
                 request.data_len,
-                request_type_flags(request.request_type),
+                request_type_flags(request.r#type),
             )
         }
         rq.set_status_desc(request.status_addr.0, 1, VIRTQ_DESC_F_WRITE);
@@ -894,7 +891,7 @@ mod tests {
 
         // Flip coin - corrupt data desc next flag.
         // Exception: flush requests do not have data desc.
-        if *coins.next().unwrap() && request.request_type != RequestType::Flush {
+        if *coins.next().unwrap() && request.r#type != RequestType::Flush {
             data_desc_flags.set(data_desc_flags.get() & !VIRTQ_DESC_F_NEXT);
             return (Err(Error::DescriptorChainTooShort), mem, q);
         }
@@ -908,7 +905,7 @@ mod tests {
 
         // Corrupt data desc accessibility
         if *coins.next().unwrap() {
-            match request.request_type {
+            match request.r#type {
                 // Readonly buffer is writable.
                 RequestType::Out => {
                     data_desc_flags.set(data_desc_flags.get() | VIRTQ_DESC_F_WRITE);
@@ -925,7 +922,7 @@ mod tests {
 
         // Flip coin - Corrupt data_len
         if *coins.next().unwrap() {
-            match request.request_type {
+            match request.r#type {
                 RequestType::In | RequestType::Out => {
                     // data_len is not a multiple of 512
                     rq.mut_data_desc()
@@ -946,7 +943,7 @@ mod tests {
 
         // Flip coin - Corrupt sector
         if *coins.next().unwrap() {
-            match request.request_type {
+            match request.r#type {
                 RequestType::In | RequestType::Out => {
                     rq.mut_hdr().sector = (sector | NUM_DISK_SECTORS) + 1;
                     return (Err(Error::InvalidOffset), mem, q);

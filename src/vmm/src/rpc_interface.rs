@@ -67,6 +67,8 @@ pub enum VmmAction {
     GetVmMachineConfig,
     /// Get microVM instance information.
     GetVmInstanceInfo,
+    /// Get microVM version.
+    GetVmmVersion,
     /// Flush the metrics. This action can only be called after the logger has been configured.
     FlushMetrics,
     /// Add a new block device or update one that already exists using the `BlockDeviceConfig` as
@@ -208,10 +210,15 @@ pub enum VmmData {
     FullVmConfig(VmmConfig),
     /// The microVM instance information.
     InstanceInformation(InstanceInfo),
+  <<<<<<< feature/uffd-on-snaps-response
     /// The microVM configuration represented by `VmConfig`.
     MachineConfiguration(VmConfig),
     /// The memory description and UFFD to serve that memory.
     UffdBackendDescription(UffdBackendDescription),
+  =======
+    /// The microVM version.
+    VmmVersion(String),
+  >>>>>>> main
 }
 
 /// Shorthand result type for external VMM commands.
@@ -321,6 +328,7 @@ impl<'a> PrebootApiController<'a> {
                 self.vm_resources.vm_config().clone(),
             )),
             GetVmInstanceInfo => Ok(VmmData::InstanceInformation(self.instance_info.clone())),
+            GetVmmVersion => Ok(VmmData::VmmVersion(self.instance_info.vmm_version.clone())),
             InsertBlockDevice(config) => self.insert_block_device(config),
             InsertNetworkDevice(config) => self.insert_net_device(config),
             LoadSnapshot(config) => self.load_snapshot(&config),
@@ -387,7 +395,7 @@ impl<'a> PrebootApiController<'a> {
     fn set_mmds_config(&mut self, cfg: MmdsConfig) -> ActionResult {
         self.boot_path = true;
         self.vm_resources
-            .set_mmds_config(cfg)
+            .set_mmds_config(cfg, &self.instance_info.id)
             .map(|()| VmmData::Empty)
             .map_err(VmmActionError::MmdsConfig)
     }
@@ -511,6 +519,9 @@ impl RuntimeApiController {
             )),
             GetVmInstanceInfo => Ok(VmmData::InstanceInformation(
                 self.vmm.lock().expect("Poisoned lock").instance_info(),
+            )),
+            GetVmmVersion => Ok(VmmData::VmmVersion(
+                self.vmm.lock().expect("Poisoned lock").version(),
             )),
             Pause => self.pause(),
             Resume => self.resume(),
@@ -699,13 +710,14 @@ impl RuntimeApiController {
 mod tests {
     use super::*;
     use crate::vmm_config::balloon::BalloonBuilder;
-    use crate::vmm_config::drive::CacheType;
+    use crate::vmm_config::drive::{CacheType, FileEngineType};
     use crate::vmm_config::logger::LoggerLevel;
     use crate::vmm_config::vsock::VsockBuilder;
     use devices::virtio::balloon::{BalloonConfig, Error as BalloonError};
     use devices::virtio::VsockError;
     use seccompiler::BpfThreadMap;
 
+    use mmds::data_store::MmdsVersion;
     use std::path::PathBuf;
 
     impl PartialEq for VmmActionError {
@@ -834,7 +846,7 @@ mod tests {
             Ok(())
         }
 
-        pub fn set_mmds_config(&mut self, _: MmdsConfig) -> Result<(), MmdsConfigError> {
+        pub fn set_mmds_config(&mut self, _: MmdsConfig, _: &str) -> Result<(), MmdsConfigError> {
             if self.force_errors {
                 return Err(MmdsConfigError::InvalidIpv4Addr);
             }
@@ -964,6 +976,10 @@ mod tests {
 
         pub fn instance_info(&self) -> InstanceInfo {
             InstanceInfo::default()
+        }
+
+        pub fn version(&self) -> String {
+            String::default()
         }
     }
 
@@ -1118,6 +1134,7 @@ mod tests {
             is_read_only: false,
             drive_id: String::new(),
             rate_limiter: None,
+            file_engine_type: FileEngineType::default(),
         });
         check_preboot_request(req, |result, vm_res| {
             assert_eq!(result, Ok(VmmData::Empty));
@@ -1132,6 +1149,7 @@ mod tests {
             is_read_only: false,
             drive_id: String::new(),
             rate_limiter: None,
+            file_engine_type: FileEngineType::default(),
         });
         check_preboot_request_err(
             req,
@@ -1147,7 +1165,6 @@ mod tests {
             guest_mac: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
-            allow_mmds_requests: false,
         });
         check_preboot_request(req, |result, vm_res| {
             assert_eq!(result, Ok(VmmData::Empty));
@@ -1160,7 +1177,6 @@ mod tests {
             guest_mac: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
-            allow_mmds_requests: false,
         });
         check_preboot_request_err(
             req,
@@ -1173,7 +1189,7 @@ mod tests {
     #[test]
     fn test_preboot_set_vsock_dev() {
         let req = VmmAction::SetVsockDevice(VsockDeviceConfig {
-            vsock_id: String::new(),
+            vsock_id: Some(String::new()),
             guest_cid: 0,
             uds_path: String::new(),
         });
@@ -1183,7 +1199,7 @@ mod tests {
         });
 
         let req = VmmAction::SetVsockDevice(VsockDeviceConfig {
-            vsock_id: String::new(),
+            vsock_id: Some(String::new()),
             guest_cid: 0,
             uds_path: String::new(),
         });
@@ -1197,13 +1213,21 @@ mod tests {
 
     #[test]
     fn test_preboot_set_mmds_config() {
-        let req = VmmAction::SetMmdsConfiguration(MmdsConfig { ipv4_address: None });
+        let req = VmmAction::SetMmdsConfiguration(MmdsConfig {
+            ipv4_address: None,
+            version: MmdsVersion::default(),
+            network_interfaces: Vec::new(),
+        });
         check_preboot_request(req, |result, vm_res| {
             assert_eq!(result, Ok(VmmData::Empty));
             assert!(vm_res.mmds_set)
         });
 
-        let req = VmmAction::SetMmdsConfiguration(MmdsConfig { ipv4_address: None });
+        let req = VmmAction::SetMmdsConfiguration(MmdsConfig {
+            ipv4_address: None,
+            version: MmdsVersion::default(),
+            network_interfaces: Vec::new(),
+        });
         check_preboot_request_err(
             req,
             VmmActionError::MmdsConfig(MmdsConfigError::InvalidIpv4Addr),
@@ -1563,6 +1587,7 @@ mod tests {
                 is_read_only: false,
                 drive_id: String::new(),
                 rate_limiter: None,
+                file_engine_type: FileEngineType::default(),
             }),
             VmmActionError::OperationNotSupportedPostBoot,
         );
@@ -1573,13 +1598,12 @@ mod tests {
                 guest_mac: None,
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
-                allow_mmds_requests: false,
             }),
             VmmActionError::OperationNotSupportedPostBoot,
         );
         check_runtime_request_err(
             VmmAction::SetVsockDevice(VsockDeviceConfig {
-                vsock_id: String::new(),
+                vsock_id: Some(String::new()),
                 guest_cid: 0,
                 uds_path: String::new(),
             }),
@@ -1591,14 +1615,18 @@ mod tests {
         );
         check_runtime_request_err(
             VmmAction::SetVsockDevice(VsockDeviceConfig {
-                vsock_id: String::new(),
+                vsock_id: Some(String::new()),
                 guest_cid: 0,
                 uds_path: String::new(),
             }),
             VmmActionError::OperationNotSupportedPostBoot,
         );
         check_runtime_request_err(
-            VmmAction::SetMmdsConfiguration(MmdsConfig { ipv4_address: None }),
+            VmmAction::SetMmdsConfiguration(MmdsConfig {
+                ipv4_address: None,
+                version: MmdsVersion::default(),
+                network_interfaces: Vec::new(),
+            }),
             VmmActionError::OperationNotSupportedPostBoot,
         );
         check_runtime_request_err(
@@ -1654,6 +1682,7 @@ mod tests {
             is_read_only: false,
             drive_id: String::new(),
             rate_limiter: None,
+            file_engine_type: FileEngineType::default(),
         });
         verify_load_snap_disallowed_after_boot_resources(req, "InsertBlockDevice");
 
@@ -1663,7 +1692,6 @@ mod tests {
             guest_mac: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
-            allow_mmds_requests: false,
         });
         verify_load_snap_disallowed_after_boot_resources(req, "InsertNetworkDevice");
 
@@ -1671,7 +1699,7 @@ mod tests {
         verify_load_snap_disallowed_after_boot_resources(req, "SetBalloonDevice");
 
         let req = VmmAction::SetVsockDevice(VsockDeviceConfig {
-            vsock_id: String::new(),
+            vsock_id: Some(String::new()),
             guest_cid: 0,
             uds_path: String::new(),
         });
@@ -1680,7 +1708,11 @@ mod tests {
         let req = VmmAction::SetVmConfiguration(VmConfig::default());
         verify_load_snap_disallowed_after_boot_resources(req, "SetVmConfiguration");
 
-        let req = VmmAction::SetMmdsConfiguration(MmdsConfig { ipv4_address: None });
+        let req = VmmAction::SetMmdsConfiguration(MmdsConfig {
+            ipv4_address: None,
+            version: MmdsVersion::default(),
+            network_interfaces: Vec::new(),
+        });
         verify_load_snap_disallowed_after_boot_resources(req, "SetMmdsConfiguration");
     }
 }

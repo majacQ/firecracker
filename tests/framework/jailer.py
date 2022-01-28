@@ -7,8 +7,8 @@ import shutil
 import stat
 from pathlib import Path
 from retry.api import retry_call
-import framework.utils as utils
-import framework.defs as defs
+from framework import utils
+from framework import defs
 from framework.defs import FC_BINARY_NAME
 
 # Default name for the socket used for API calls.
@@ -26,7 +26,6 @@ class JailerContext:
     # Keep in sync with parameters from code base.
     jailer_id = None
     exec_file = None
-    numa_node = None
     uid = None
     gid = None
     chroot_base = None
@@ -38,12 +37,12 @@ class JailerContext:
     cgroups = None
     resource_limits = None
     cgroup_ver = None
+    parent_cgroup = None
 
     def __init__(
             self,
             jailer_id,
             exec_file,
-            numa_node=None,
             uid=1234,
             gid=1234,
             chroot_base=DEFAULT_CHROOT_PATH,
@@ -53,6 +52,7 @@ class JailerContext:
             cgroups=None,
             resource_limits=None,
             cgroup_ver=None,
+            parent_cgroup=None,
             **extra_args
     ):
         """Set up jailer fields.
@@ -63,7 +63,6 @@ class JailerContext:
         """
         self.jailer_id = jailer_id
         self.exec_file = exec_file
-        self.numa_node = numa_node
         self.uid = uid
         self.gid = gid
         self.chroot_base = chroot_base
@@ -75,6 +74,7 @@ class JailerContext:
         self.cgroups = cgroups
         self.resource_limits = resource_limits
         self.cgroup_ver = cgroup_ver
+        self.parent_cgroup = parent_cgroup
         self.ramfs_subdir_name = 'ramfs'
         self._ramfs_path = None
 
@@ -100,8 +100,6 @@ class JailerContext:
             jailer_param_list.extend(['--id', str(self.jailer_id)])
         if self.exec_file is not None:
             jailer_param_list.extend(['--exec-file', str(self.exec_file)])
-        if self.numa_node is not None:
-            jailer_param_list.extend(['--node', str(self.numa_node)])
         if self.uid is not None:
             jailer_param_list.extend(['--uid', str(self.uid)])
         if self.gid is not None:
@@ -116,6 +114,10 @@ class JailerContext:
             jailer_param_list.append('--daemonize')
         if self.new_pid_ns:
             jailer_param_list.append('--new-pid-ns')
+        if self.parent_cgroup:
+            jailer_param_list.extend(
+                ['--parent-cgroup', str(self.parent_cgroup)]
+            )
         if self.cgroup_ver:
             jailer_param_list.extend(
                 ['--cgroup-version', str(self.cgroup_ver)]

@@ -3,7 +3,9 @@
 """Defines classes for all the resources a microvm could need attaching."""
 
 import urllib
+import re
 
+from framework.utils import compare_versions, is_io_uring_supported, run_cmd
 from framework.defs import API_USOCKET_URL_PREFIX
 
 
@@ -192,16 +194,45 @@ class Drive():
 
     DRIVE_CFG_RESOURCE = 'drives'
 
-    def __init__(self, api_usocket_full_name, api_session):
+    def __init__(
+        self,
+        api_usocket_full_name,
+        api_session,
+        firecracker_version
+    ):
         """Specify the information needed for sending API requests."""
         url_encoded_path = urllib.parse.quote_plus(api_usocket_full_name)
         api_url = API_USOCKET_URL_PREFIX + url_encoded_path + '/'
 
         self._drive_cfg_url = api_url + self.DRIVE_CFG_RESOURCE
         self._api_session = api_session
+        self._firecracker_version = firecracker_version
 
     def put(self, **args):
         """Attach a block device or update the details of a previous one."""
+        # Default the io engine to Async on kernels > 5.10 so that we
+        # make sure to exercise both Sync and Async behaviour in the CI.
+        # Also check the FC version to make sure that it has support for
+        # configurable io_engine.
+        if is_io_uring_supported() and \
+            compare_versions(self._firecracker_version, "0.25.0") > 0 \
+            and \
+                ('io_engine' not in args or args['io_engine'] is None):
+            args['io_engine'] = 'Async'
+
+        datax = self.create_json(**args)
+
+        return self._api_session.put(
+            "{}/{}".format(self._drive_cfg_url, args['drive_id']),
+            json=datax
+        )
+
+    def put_with_default_io_engine(self, **args):
+        """
+        Attach a block device or update the details of a previous one, using...
+
+        ...the Firecracker default for the io_engine.
+        """
         datax = self.create_json(**args)
 
         return self._api_session.put(
@@ -232,7 +263,8 @@ class Drive():
             partuuid=None,
             is_read_only=None,
             rate_limiter=None,
-            cache_type=None):
+            cache_type=None,
+            io_engine=None):
         """Compose the json associated to this type of API request."""
         datax = {}
 
@@ -257,6 +289,9 @@ class Drive():
         if rate_limiter is not None:
             datax['rate_limiter'] = rate_limiter
 
+        if io_engine is not None:
+            datax['io_engine'] = io_engine
+
         return datax
 
 
@@ -279,6 +314,38 @@ class FullConfig():
         """Get full configuration of the current microvm."""
         return self._api_session.get(
             self._export_cfg_url
+        )
+
+
+# Too few public methods (1/2) (too-few-public-methods)
+# pylint: disable=R0903
+class InstanceVersion():
+    """Facility for getting the microVM version."""
+
+    VERSION_CFG_RESOURCE = 'version'
+
+    def __init__(self, api_usocket_full_name, fc_binary_path, api_session):
+        """Specify the information needed for sending API requests."""
+        url_encoded_path = urllib.parse.quote_plus(api_usocket_full_name)
+        api_url = API_USOCKET_URL_PREFIX + url_encoded_path + '/'
+
+        self._version_cfg_url = api_url + self.VERSION_CFG_RESOURCE
+        self._fc_binary_path = fc_binary_path
+        self._api_session = api_session
+
+    def get(self):
+        """Get the version of the current microvm, from the cmdline."""
+        _, stdout, _ = run_cmd(
+            "{} --version".format(self._fc_binary_path))
+
+        return re.match(
+            r"^Firecracker v([0-9]+\.[0-9]+(\.[0-9]+)?)",
+            stdout.partition('\n')[0]).group(1)
+
+    def get_from_api(self):
+        """Get the version of the current microvm, from the API."""
+        return self._api_session.get(
+            self._version_cfg_url
         )
 
 
@@ -496,13 +563,18 @@ class MachineConfigure():
 
     MACHINE_CFG_RESOURCE = 'machine-config'
 
-    def __init__(self, api_usocket_full_name, api_session):
+    def __init__(
+            self,
+            api_usocket_full_name,
+            api_session,
+            firecracker_version):
         """Specify the information needed for sending API requests."""
         url_encoded_path = urllib.parse.quote_plus(api_usocket_full_name)
         api_url = API_USOCKET_URL_PREFIX + url_encoded_path + '/'
 
         self._machine_cfg_url = api_url + self.MACHINE_CFG_RESOURCE
         self._api_session = api_session
+        self._firecracker_version = firecracker_version
         self._datax = {}
 
     @property
@@ -535,11 +607,11 @@ class MachineConfigure():
             self._machine_cfg_url
         )
 
-    @staticmethod
     def create_json(
+            self,
             vcpu_count=None,
             mem_size_mib=None,
-            ht_enabled=None,
+            smt=None,
             cpu_template=None,
             track_dirty_pages=None):
         """Compose the json associated to this type of API request."""
@@ -550,8 +622,10 @@ class MachineConfigure():
         if mem_size_mib is not None:
             datax['mem_size_mib'] = mem_size_mib
 
-        if ht_enabled is not None:
-            datax['ht_enabled'] = ht_enabled
+        if compare_versions(self._firecracker_version, "0.25.0") <= 0:
+            datax['ht_enabled'] = False if smt is None else smt
+        elif smt is not None:
+            datax['smt'] = smt
 
         if cpu_template is not None:
             datax['cpu_template'] = cpu_template
@@ -597,7 +671,7 @@ class MMDS():
         )
 
     def get(self):
-        """Get the status of the mmds request."""
+        """Get the status of the MMDS request."""
         return self._api_session.get(
             self._mmds_cfg_url
         )
@@ -639,7 +713,6 @@ class Network():
             iface_id=None,
             host_dev_name=None,
             guest_mac=None,
-            allow_mmds_requests=None,
             rx_rate_limiter=None,
             tx_rate_limiter=None):
         """Create the json for the net specific API request."""
@@ -652,9 +725,6 @@ class Network():
 
         if guest_mac is not None:
             datax['guest_mac'] = guest_mac
-
-        if allow_mmds_requests is not None:
-            datax['allow_mmds_requests'] = allow_mmds_requests
 
         if tx_rate_limiter is not None:
             datax['tx_rate_limiter'] = tx_rate_limiter
@@ -730,14 +800,15 @@ class Vsock():
 
     @staticmethod
     def create_json(
-            vsock_id,
             guest_cid,
-            uds_path):
+            uds_path,
+            vsock_id=None):
         """Create the json for the vsock specific API request."""
         datax = {
-            'vsock_id': vsock_id,
             'guest_cid': guest_cid,
             'uds_path': uds_path
         }
+        if vsock_id:
+            datax['vsock_id'] = vsock_id
 
         return datax

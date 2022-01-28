@@ -4,6 +4,7 @@ mod cgroup;
 mod chroot;
 mod env;
 mod resource_limits;
+use std::env as p_env;
 
 use std::ffi::{CString, NulError, OsString};
 use std::fmt;
@@ -30,6 +31,7 @@ pub enum Error {
     CgroupHierarchyMissing(String),
     CgroupControllerUnavailable(String),
     CgroupInvalidVersion(String),
+    CgroupInvalidParentPath(),
     ChangeFileOwner(PathBuf, io::Error),
     ChdirNewRoot(io::Error),
     Chmod(PathBuf, io::Error),
@@ -54,7 +56,6 @@ pub enum Error {
     MountPropagationSlave(io::Error),
     NotAFile(PathBuf),
     NotADirectory(PathBuf),
-    NumaNode(String),
     OpenDevNull(io::Error),
     OsStringParsing(PathBuf, OsString),
     PivotRoot(io::Error),
@@ -116,6 +117,12 @@ impl fmt::Display for Error {
             CgroupControllerUnavailable(ref arg) => write!(f, "Controller {} is unavailable", arg,),
             CgroupInvalidVersion(ref arg) => {
                 write!(f, "{} is an invalid cgroup version specifier", arg,)
+            }
+            CgroupInvalidParentPath() => {
+                write!(
+                    f,
+                    "Parent cgroup path is invalid. Path should not be absolute or contain '..' or '.'",
+                )
             }
             ChangeFileOwner(ref path, ref err) => {
                 write!(f, "Failed to change owner for {:?}: {}", path, err)
@@ -184,7 +191,6 @@ impl fmt::Display for Error {
                 "{}",
                 format!("{:?} is not a directory", path).replace("\"", "")
             ),
-            NumaNode(ref node) => write!(f, "Invalid numa node: {}", node),
             OpenDevNull(ref err) => write!(f, "Failed to open /dev/null: {}", err),
             OsStringParsing(ref path, _) => write!(
                 f,
@@ -254,12 +260,6 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                 .help("File path to exec into."),
         )
         .arg(
-            Argument::new("node")
-                .required(false)
-                .takes_value(true)
-                .help("NUMA node to assign this microVM to."),
-        )
-        .arg(
             Argument::new("uid")
                 .required(true)
                 .takes_value(true)
@@ -312,6 +312,11 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                 .help("Select the cgroup version used by the jailer."),
         )
         .arg(
+            Argument::new("parent-cgroup")
+                .takes_value(true)
+                .help("Parent cgroup in which the cgroup of this microvm will be placed."),
+        )
+        .arg(
             Argument::new("version")
                 .takes_value(false)
                 .help("Print the binary version number."),
@@ -357,6 +362,18 @@ fn sanitize_process() {
                 unsafe { libc::close(fd) };
             }
         }
+    }
+
+    // Cleanup environment variables
+    clean_env_vars();
+}
+
+fn clean_env_vars() {
+    // Remove environment variables received from
+    // the parent process so there are no leaks
+    // inside the jailer environment
+    for (key, _) in p_env::vars() {
+        p_env::remove_var(key);
     }
 }
 
@@ -421,6 +438,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::fs::File;
     use std::os::unix::io::IntoRawFd;
 
@@ -448,6 +466,25 @@ mod tests {
         }
 
         assert!(fs::remove_dir_all(tmp_dir_path).is_ok());
+    }
+
+    #[test]
+    fn test_clean_env_vars() {
+        let env_vars: [&str; 5] = ["VAR1", "VAR2", "VAR3", "VAR4", "VAR5"];
+
+        // Set environment variables
+        for env_var in env_vars.iter() {
+            env::set_var(env_var, "0");
+        }
+
+        // Cleanup the environment
+        clean_env_vars();
+
+        // Assert that the variables set beforehand
+        // do not exist anymore
+        for env_var in env_vars.iter() {
+            assert_eq!(env::var_os(env_var), None);
+        }
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -640,10 +677,6 @@ mod tests {
         assert_eq!(
             format!("{}", Error::NotADirectory(file_path.clone())),
             "/foo/bar is not a directory",
-        );
-        assert_eq!(
-            format!("{}", Error::NumaNode(id.to_string())),
-            "Invalid numa node: foobar",
         );
         assert_eq!(
             format!("{}", Error::OpenDevNull(io::Error::from_raw_os_error(42))),

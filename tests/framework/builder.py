@@ -13,7 +13,7 @@ from framework.artifacts import (
     ArtifactCollection, Artifact, DiskArtifact, Snapshot,
     SnapshotType, NetIfaceConfig
 )
-import framework.utils as utils
+from framework import utils
 import host_tools.logging as log_tools
 import host_tools.network as net_tools
 
@@ -88,7 +88,8 @@ class MicrovmBuilder:
               cpu_template=None,
               fc_binary=None,
               jailer_binary=None,
-              use_ramdisk=False):
+              use_ramdisk=False,
+              smt=None):
         """Build a fresh microvm."""
         vm = init_microvm(self.root_path, self.bin_cloner_path,
                           fc_binary, jailer_binary)
@@ -124,12 +125,12 @@ class MicrovmBuilder:
             response = vm.network.put(
                 iface_id=iface.dev_name,
                 host_dev_name=iface.tap_name,
-                guest_mac=guest_mac,
-                allow_mmds_requests=True,
+                guest_mac=guest_mac
             )
             assert vm.api_session.is_status_no_content(response.status_code)
 
-        with open(config.local_path()) as microvm_config_file:
+        with open(config.local_path(), encoding='utf-8') as \
+                microvm_config_file:
             microvm_config = json.load(microvm_config_file)
 
         response = vm.basic_config(
@@ -152,7 +153,7 @@ class MicrovmBuilder:
         response = vm.machine_cfg.put(
             vcpu_count=int(microvm_config['vcpu_count']),
             mem_size_mib=int(microvm_config['mem_size_mib']),
-            ht_enabled=bool(microvm_config['ht_enabled']),
+            smt=smt,
             track_dirty_pages=diff_snapshots,
             cpu_template=cpu_template,
         )

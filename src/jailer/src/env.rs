@@ -6,7 +6,7 @@ use std::fs::{self, canonicalize, File, OpenOptions, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::cgroup::{Cgroup, CgroupBuilder};
@@ -35,6 +35,12 @@ const DEV_KVM_MINOR: u32 = 232;
 const DEV_NET_TUN_WITH_NUL: &[u8] = b"/dev/net/tun\0";
 const DEV_NET_TUN_MAJOR: u32 = 10;
 const DEV_NET_TUN_MINOR: u32 = 200;
+
+// Random number generator device minor/major numbers are taken from
+// https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
+const DEV_URANDOM_WITH_NUL: &[u8] = b"/dev/urandom\0";
+const DEV_URANDOM_MAJOR: u32 = 1;
+const DEV_URANDOM_MINOR: u32 = 9;
 
 const DEV_NULL_WITH_NUL: &[u8] = b"/dev/null\0";
 
@@ -159,6 +165,17 @@ impl Env {
 
         // Optional arguments.
         let mut cgroups: Vec<Box<dyn Cgroup>> = Vec::new();
+        let parent_cgroup = match arguments.single_value("parent-cgroup") {
+            Some(parent_cg) => Path::new(parent_cg),
+            None => Path::new(exec_file_name),
+        };
+        if parent_cgroup
+            .components()
+            .any(|c| c == Component::CurDir || c == Component::ParentDir || c == Component::RootDir)
+        {
+            return Err(Error::CgroupInvalidParentPath());
+        }
+
         let cgroup_ver = arguments
             .single_value("cgroup-version")
             .ok_or_else(|| Error::ArgumentParsing(MissingValue("cgroup-version".to_string())))?;
@@ -168,19 +185,6 @@ impl Env {
 
         let mut cgroup_builder = None;
 
-        // If `--node` is used, the corresponding cgroups will be created.
-        if let Some(numa_node_str) = arguments.single_value("node") {
-            let numa_node = numa_node_str
-                .parse::<u32>()
-                .map_err(|_| Error::NumaNode(numa_node_str.to_owned()))?;
-
-            let builder = cgroup_builder.get_or_insert(CgroupBuilder::new(cgroup_ver)?);
-
-            let mut numa_cgroups =
-                builder.cgroups_from_numa_node(numa_node, id, &exec_file_name)?;
-            cgroups.append(&mut numa_cgroups);
-        }
-
         // cgroup format: <cgroup_controller>.<cgroup_property>=<value>,...
         if let Some(cgroups_args) = arguments.multiple_values("cgroup") {
             let builder = cgroup_builder.get_or_insert(CgroupBuilder::new(cgroup_ver)?);
@@ -189,12 +193,18 @@ impl Env {
                 if aux.len() != 2 || aux[1].is_empty() {
                     return Err(Error::CgroupFormat(cg.to_string()));
                 }
+                let file = Path::new(aux[0]);
+                if file.components().any(|c| {
+                    c == Component::CurDir || c == Component::ParentDir || c == Component::RootDir
+                }) {
+                    return Err(Error::CgroupInvalidFile(cg.to_string()));
+                }
 
                 let cgroup = builder.new_cgroup(
                     aux[0].to_string(), // cgroup file
                     aux[1].to_string(), // cgroup value
                     id,
-                    &exec_file_name,
+                    parent_cgroup,
                 )?;
                 cgroups.push(cgroup);
             }
@@ -555,6 +565,18 @@ impl Env {
         self.mknod_and_own_dev(DEV_NET_TUN_WITH_NUL, DEV_NET_TUN_MAJOR, DEV_NET_TUN_MINOR)?;
         // Do the same for /dev/kvm with (major, minor) = (10, 232).
         self.mknod_and_own_dev(DEV_KVM_WITH_NUL, DEV_KVM_MAJOR, DEV_KVM_MINOR)?;
+        // And for /dev/urandom with (major, minor) = (1, 9).
+        // If the device is not accessible on the host, output a warning to inform user that MMDS
+        // version 2 will not be available to use.
+        let _ = self
+            .mknod_and_own_dev(DEV_URANDOM_WITH_NUL, DEV_URANDOM_MAJOR, DEV_URANDOM_MINOR)
+            .map_err(|err| {
+                println!(
+                    "Warning! Could not create /dev/urandom device inside jailer: {}.",
+                    err
+                );
+                println!("MMDS version 2 will not be available to use.");
+            });
 
         // Daemonize before exec, if so required (when the dev_null variable != None).
         if let Some(fd) = dev_null {
@@ -596,7 +618,6 @@ mod tests {
 
     #[derive(Clone)]
     struct ArgVals<'a> {
-        pub node: &'a str,
         pub id: &'a str,
         pub exec_file: &'a str,
         pub uid: &'a str,
@@ -607,12 +628,12 @@ mod tests {
         pub new_pid_ns: bool,
         pub cgroups: Vec<&'a str>,
         pub resource_limits: Vec<&'a str>,
+        pub parent_cgroup: Option<&'a str>,
     }
 
     impl ArgVals<'_> {
         pub fn new() -> ArgVals<'static> {
             ArgVals {
-                node: "0",
                 id: "bd65600d-8669-4903-8a14-af88203add38",
                 exec_file: "/proc/cpuinfo",
                 uid: "1001",
@@ -623,6 +644,7 @@ mod tests {
                 new_pid_ns: true,
                 cgroups: vec!["cpu.shares=2", "cpuset.mems=0"],
                 resource_limits: vec!["no-file=1024", "fsize=1048575"],
+                parent_cgroup: None,
             }
         }
     }
@@ -630,8 +652,6 @@ mod tests {
     fn make_args(arg_vals: &ArgVals) -> Vec<String> {
         let mut arg_vec = vec![
             "--binary-name",
-            "--node",
-            arg_vals.node,
             "--id",
             arg_vals.id,
             "--exec-file",
@@ -670,6 +690,11 @@ mod tests {
 
         if arg_vals.new_pid_ns {
             arg_vec.push("--new-pid-ns".to_string());
+        }
+
+        if let Some(parent_cg) = arg_vals.parent_cgroup {
+            arg_vec.push("--parent-cgroup".to_string());
+            arg_vec.push(parent_cg.to_string());
         }
 
         arg_vec
@@ -737,16 +762,6 @@ mod tests {
             ..another_good_arg_vals.clone()
         };
 
-        let invalid_node_arg_vals = ArgVals {
-            node: "zzz",
-            ..base_invalid_arg_vals.clone()
-        };
-
-        let arg_parser = build_arg_parser();
-        args = arg_parser.arguments().clone();
-        args.parse(&make_args(&invalid_node_arg_vals)).unwrap();
-        assert!(Env::new(&args, 0, 0).is_err());
-
         let invalid_cgroup_arg_vals = ArgVals {
             cgroups: vec!["zzz"],
             ..base_invalid_arg_vals.clone()
@@ -806,6 +821,34 @@ mod tests {
         let arg_parser = build_arg_parser();
         args = arg_parser.arguments().clone();
         args.parse(&make_args(&invalid_gid_arg_vals)).unwrap();
+        assert!(Env::new(&args, 0, 0).is_err());
+
+        let invalid_parent_cg_vals = ArgVals {
+            parent_cgroup: Some("/root"),
+            ..base_invalid_arg_vals.clone()
+        };
+
+        let arg_parser = build_arg_parser();
+        args = arg_parser.arguments().clone();
+        args.parse(&make_args(&invalid_parent_cg_vals)).unwrap();
+        assert!(Env::new(&args, 0, 0).is_err());
+
+        let invalid_controller_pt = ArgVals {
+            cgroups: vec!["../file_name=1", "./root=1", "/home=1"],
+            ..another_good_arg_vals.clone()
+        };
+        let arg_parser = build_arg_parser();
+        args = arg_parser.arguments().clone();
+        args.parse(&make_args(&invalid_controller_pt)).unwrap();
+        assert!(Env::new(&args, 0, 0).is_err());
+
+        let invalid_format = ArgVals {
+            cgroups: vec!["./root/", "../root"],
+            ..another_good_arg_vals.clone()
+        };
+        let arg_parser = build_arg_parser();
+        args = arg_parser.arguments().clone();
+        args.parse(&make_args(&invalid_format)).unwrap();
         assert!(Env::new(&args, 0, 0).is_err());
 
         // The chroot-base-dir param is not validated by Env::new, but rather in run, when we
@@ -945,7 +988,6 @@ mod tests {
         let some_dir_path = some_dir.as_path().to_str().unwrap();
 
         let some_arg_vals = ArgVals {
-            node: "0",
             id: "bd65600d-8669-4903-8a14-af88203add38",
             exec_file: some_file_path,
             uid: "1001",
@@ -956,6 +998,7 @@ mod tests {
             new_pid_ns: false,
             cgroups: Vec::new(),
             resource_limits: Vec::new(),
+            parent_cgroup: None,
         };
         fs::write(some_file_path, "some_content").unwrap();
         args.parse(&make_args(&some_arg_vals)).unwrap();
@@ -1023,15 +1066,6 @@ mod tests {
         args.parse(&make_args(&invalid_cgroup_arg_vals)).unwrap();
         assert!(Env::new(&args, 0, 0).is_err());
 
-        // Check string with multiple "."
-        let mut args = arg_parser.arguments().clone();
-        let invalid_cgroup_arg_vals = ArgVals {
-            cgroups: vec!["cpu.set.cpus=2"],
-            ..good_arg_vals.clone()
-        };
-        args.parse(&make_args(&invalid_cgroup_arg_vals)).unwrap();
-        assert!(Env::new(&args, 0, 0).is_err());
-
         // Check empty string
         let mut args = arg_parser.arguments().clone();
         let invalid_cgroup_arg_vals = ArgVals {
@@ -1059,7 +1093,7 @@ mod tests {
         args.parse(&make_args(&invalid_cgroup_arg_vals)).unwrap();
         assert!(Env::new(&args, 0, 0).is_err());
 
-        // Cases that should success
+        // Cases that should succeed
 
         // Check value with special characters (',', '.', '-')
         let mut args = arg_parser.arguments().clone();
@@ -1074,6 +1108,15 @@ mod tests {
         let mut args = arg_parser.arguments().clone();
         let invalid_cgroup_arg_vals = ArgVals {
             cgroups: vec!["cpuset.cpus=2"],
+            ..good_arg_vals.clone()
+        };
+        args.parse(&make_args(&invalid_cgroup_arg_vals)).unwrap();
+        assert!(Env::new(&args, 0, 0).is_ok());
+
+        // Check file with multiple "."
+        let mut args = arg_parser.arguments().clone();
+        let invalid_cgroup_arg_vals = ArgVals {
+            cgroups: vec!["memory.swap.high=2"],
             ..good_arg_vals.clone()
         };
         args.parse(&make_args(&invalid_cgroup_arg_vals)).unwrap();
