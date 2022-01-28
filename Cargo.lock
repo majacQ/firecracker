@@ -535,7 +535,11 @@ dependencies = [
  "libc",
  "proptest",
  "utils",
+  <<<<<<< feature/io_uring
+ "vm-memory 0.7.0",
+  =======
  "vm-memory 0.1.0",
+  >>>>>>> main
 ]
 
 [[package]]
@@ -606,6 +610,11 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
 name = "libc"
+  <<<<<<< feature/io_uring
+version = "0.2.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b2f96d100e1cf1929e7719b7edb3b90ab5298072638fccd77be9ce942ecdfce"
+  =======
   <<<<<<< feature/uffd-on-snaps-response
 version = "0.2.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -624,6 +633,7 @@ dependencies = [
 version = "0.2.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fbe5e23404da5b4f555ef85ebed98fb4083e55a00c317800bc2a50ede9f3d219"
+  >>>>>>> main
   >>>>>>> main
 
 [[package]]
@@ -1312,6 +1322,16 @@ dependencies = [
  "libc",
  "utils",
  "vm-memory 0.7.0",
+]
+
+[[package]]
+name = "vm-memory"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "339d4349c126fdcd87e034631d7274370cf19eb0e87b33166bcd956589fc72c5"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

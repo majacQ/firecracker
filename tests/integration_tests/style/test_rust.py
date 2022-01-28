@@ -53,7 +53,11 @@ def test_ensure_mod_tests():
     error_msg = (
         f'Tests found in files without a "tests" module:\n {stdout} '
         'To ensure code coverage is reported correctly, please check that '
+  <<<<<<< feature/io_uring
+        'your tests are in a module named "tests".'.format(stdout)
+  =======
         'your tests are in a module named "tests".'
+  >>>>>>> main
     )
 
     assert not stdout, error_msg

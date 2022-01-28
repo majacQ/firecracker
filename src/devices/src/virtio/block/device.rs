@@ -30,11 +30,15 @@ use super::{
     Error, CONFIG_SPACE_SIZE, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
 };
 use crate::virtio::{IrqTrigger, IrqType};
+  <<<<<<< feature/io_uring
+use block_io::FileEngine;
+  =======
   <<<<<<< feature/uffd-on-snaps-response
 
 use logger::info;
   =======
 use block_io::FileEngine;
+  >>>>>>> main
   >>>>>>> main
 use serde::{Deserialize, Serialize};
 use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -247,11 +251,14 @@ impl Block {
         is_disk_read_only: bool,
         is_disk_root: bool,
         rate_limiter: RateLimiter,
+  <<<<<<< feature/io_uring
+  =======
   <<<<<<< feature/uffd-on-snaps-response
     ) -> io::Result<Block> {
         info!("block inner 1");
         let disk_properties = DiskProperties::new(disk_image_path, is_disk_read_only, cache_type)?;
   =======
+  >>>>>>> main
         file_engine_type: FileEngineType,
     ) -> result::Result<Block, Error> {
         let disk_properties = DiskProperties::new(
@@ -260,7 +267,10 @@ impl Block {
             cache_type,
             file_engine_type,
         )?;
+  <<<<<<< feature/io_uring
+  =======
   >>>>>>> main
+ >>>>>>> main
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 

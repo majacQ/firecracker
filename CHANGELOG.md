@@ -49,6 +49,15 @@
 - Removed the `--node` jailer parameter.
 - Deprecated `vsock_id` body field in `PUT`s on `/vsock`.
 - Removed the deprecated the `--seccomp-level parameter`.
+  <<<<<<< feature/io_uring
+- Added `io_engine` to the pre-boot block device configuration.
+  Possible values: `Sync` (the default option) or `Async` (only available for
+  kernels newer than 5.10.51). The `Async` variant introduces a block device
+  engine that uses io_uring for executing requests asynchronously.
+  See `docs/api_requests/block-io-engine.md`.
+- Added `block.io_engine_throttled_events` metric for measuring the number of
+  virtio events throttled because of the IO engine.
+  =======
 - `GET` requests to MMDS require a session token to be provided through
   `X-metadata-token` header when using V2.
 - Allow `PUT` requests to MMDS in order to generate a session token
@@ -61,6 +70,7 @@
 - `smt` field is now optional on PUT `/machine-config`, defaulting to
   `false`.
 - Configuring `smt: true` on aarch64 via the API is forbidden.
+  >>>>>>> main
 
 ### Fixed
 

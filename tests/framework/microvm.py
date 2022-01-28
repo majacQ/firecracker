@@ -518,6 +518,11 @@ class Microvm:
         self.mmds = MMDS(self._api_socket, self._api_session)
         self.network = Network(self._api_socket, self._api_session)
         self.snapshot = SnapshotHelper(self._api_socket, self._api_session)
+  <<<<<<< feature/io_uring
+        self.version = InstanceVersion(
+            self._api_socket, self._fc_binary_path, self._api_session)
+  =======
+  >>>>>>> main
         self.drive = Drive(self._api_socket, self._api_session,
                            self.firecracker_version)
         self.vm = Vm(self._api_socket, self._api_session)

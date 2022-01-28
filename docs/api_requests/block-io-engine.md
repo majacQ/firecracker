@@ -4,9 +4,13 @@ For all Firecracker versions prior to v1.0.0, the emulated block device uses a
 synchronous IO engine for executing the device requests, based on blocking
 system calls.
 
+  <<<<<<< feature/io_uring
+Firecracker 1.0.0 adds support for a new asynchronous block device IO engine.
+  =======
 Firecracker 1.0.0 adds support for an asynchronous block device IO engine.
 Support is currently in **developer preview**. See
 [this section](#developer-preview-status) for more info.
+  >>>>>>> main
 
 The `Async` engine leverages [`io_uring`](https://kernel.dk/io_uring.pdf) for
 executing requests in an async manner, therefore getting overall higher
@@ -17,7 +21,11 @@ The block IO engine is configured via the PUT /drives API call (pre-boot only),
 with the `io_engine` field taking two possible values:
 
 - `Sync` (default)
+  <<<<<<< feature/io_uring
+- `Async`
+  =======
 - `Async` (in [developer preview](../RELEASE_POLICY.md))
+  >>>>>>> main
 
 The `Sync` variant is the default, in order to provide backwards compatibility
 with older Firecracker versions.
@@ -34,7 +42,11 @@ curl --unix-socket ${socket} -i \
              \"path_on_host\": \"${drive_path}\",
              \"is_root_device\": true,
              \"is_read_only\": false,
+  <<<<<<< feature/io_uring
+             \"io_engine\": \"Async\"
+  =======
              \"io_engine\": \"Sync\"
+  >>>>>>> main
          }"
 ```
 
@@ -51,12 +63,19 @@ If a block device is configured with the `Async` io_engine on a host kernel
 older than 5.10.51, the API call will return a 400 Bad Request, with a
 suggestive error message.
 
+  <<<<<<< feature/io_uring
+## Recommendations
+
+In order to get the higher disk IO throughput, it is recommended to use the
+`Async` io_engine on hosts that support it.
+  =======
 ## Performance considerations
 
 The performance is strictly tied to the host kernel version. The gathered data
 may not be relevant for modified/newer kernels than 5.10.
 
 ### Device creation
+  >>>>>>> main
 
 When using the `Async` variant, there is added latency on device creation (up
 to ~110 ms), caused by the extra io_uring system calls performed by
@@ -69,6 +88,8 @@ This translates to higher latencies on either of these operations:
 
 For use-cases where the lowest latency on the aforementioned operations is
 desired, it is recommended to use the `Sync` IO engine.
+  <<<<<<< feature/io_uring
+  =======
 
 ### Block IOPS and efficiency
 
@@ -148,3 +169,4 @@ kernel including mitigations for the aforementioned mitigations is released and
 support for it is added in Firecracker.
 
 Read more about Firecracker's [kernel support policy](../kernel-policy.md).
+  >>>>>>> main

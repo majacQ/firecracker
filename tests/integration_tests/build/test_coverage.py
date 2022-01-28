@@ -23,15 +23,25 @@ from host_tools import proc
 # caused by io_uring, which is only supported by FC for kernels newer
 # than 5.10.
 
+# We have different coverages based on the host kernel version. This is
+# caused by io_uring, which is only supported by FC for kernels newer
+# than 5.10.
+
 # AMD has a slightly different coverage due to
 # the appearance of the brand string. On Intel,
 # this contains the frequency while on AMD it does not.
 # Checkout the cpuid crate. In the future other
 # differences may appear.
 if utils.is_io_uring_supported():
+  <<<<<<< feature/io_uring
+    COVERAGE_DICT = {"Intel": 84.79, "AMD": 84.24, "ARM": 83.02}
+else:
+    COVERAGE_DICT = {"Intel": 81.76, "AMD": 81.17, "ARM": 79.94}
+  =======
     COVERAGE_DICT = {"Intel": 85.09, "AMD": 84.51, "ARM": 84.04}
 else:
     COVERAGE_DICT = {"Intel": 82.03, "AMD": 81.5, "ARM": 80.98}
+  >>>>>>> main
 
 PROC_MODEL = proc.proc_type()
 
