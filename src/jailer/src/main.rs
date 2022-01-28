@@ -3,6 +3,8 @@
 mod cgroup;
 mod chroot;
 mod env;
+mod resource_limits;
+use std::env as p_env;
 
 use std::ffi::{CString, NulError, OsString};
 use std::fmt;
@@ -26,9 +28,14 @@ pub enum Error {
     CgroupInvalidFile(String),
     CgroupWrite(String, String, String),
     CgroupFormat(String),
+    CgroupHierarchyMissing(String),
+    CgroupControllerUnavailable(String),
+    CgroupInvalidVersion(String),
+    CgroupInvalidParentPath(),
     ChangeFileOwner(PathBuf, io::Error),
     ChdirNewRoot(io::Error),
     Chmod(PathBuf, io::Error),
+    Clone(io::Error),
     CloseNetNsFd(io::Error),
     CloseDevNullFd(io::Error),
     Copy(PathBuf, PathBuf, io::Error),
@@ -49,22 +56,24 @@ pub enum Error {
     MountPropagationSlave(io::Error),
     NotAFile(PathBuf),
     NotADirectory(PathBuf),
-    NumaNode(String),
     OpenDevNull(io::Error),
     OsStringParsing(PathBuf, OsString),
     PivotRoot(io::Error),
     ReadLine(PathBuf, io::Error),
     ReadToString(PathBuf, io::Error),
     RegEx(regex::Error),
+    ResLimitArgument(String),
+    ResLimitFormat(String),
+    ResLimitValue(String, String),
     RmOldRootDir(io::Error),
     SetCurrentDir(io::Error),
     SetNetNs(io::Error),
+    Setrlimit(String),
     SetSid(io::Error),
     Uid(String),
     UmountOldRoot(io::Error),
     UnexpectedListenerFd(i32),
     UnshareNewNs(io::Error),
-    UnshareNewPID(io::Error),
     UnsetCloexec(io::Error),
     Write(PathBuf, io::Error),
 }
@@ -104,10 +113,22 @@ impl fmt::Display for Error {
                 evalue, file, rvalue
             ),
             CgroupFormat(ref arg) => write!(f, "Invalid format for cgroups: {}", arg,),
+            CgroupHierarchyMissing(ref arg) => write!(f, "Hierarchy not found: {}", arg,),
+            CgroupControllerUnavailable(ref arg) => write!(f, "Controller {} is unavailable", arg,),
+            CgroupInvalidVersion(ref arg) => {
+                write!(f, "{} is an invalid cgroup version specifier", arg,)
+            }
+            CgroupInvalidParentPath() => {
+                write!(
+                    f,
+                    "Parent cgroup path is invalid. Path should not be absolute or contain '..' or '.'",
+                )
+            }
             ChangeFileOwner(ref path, ref err) => {
                 write!(f, "Failed to change owner for {:?}: {}", path, err)
             }
             ChdirNewRoot(ref err) => write!(f, "Failed to chdir into chroot directory: {}", err),
+            Clone(ref err) => write!(f, "Failed cloning into a new child process: {}", err),
             CloseNetNsFd(ref err) => write!(f, "Failed to close netns fd: {}", err),
             CloseDevNullFd(ref err) => write!(f, "Failed to close /dev/null fd: {}", err),
             Copy(ref file, ref path, ref err) => write!(
@@ -170,7 +191,6 @@ impl fmt::Display for Error {
                 "{}",
                 format!("{:?} is not a directory", path).replace("\"", "")
             ),
-            NumaNode(ref node) => write!(f, "Invalid numa node: {}", node),
             OpenDevNull(ref err) => write!(f, "Failed to open /dev/null: {}", err),
             OsStringParsing(ref path, _) => write!(
                 f,
@@ -189,9 +209,15 @@ impl fmt::Display for Error {
                 format!("Failed to read file {:?} into a string: {}", path, err).replace("\"", "")
             ),
             RegEx(ref err) => write!(f, "Regex failed: {:?}", err),
+            ResLimitArgument(ref arg) => write!(f, "Invalid resource argument: {}", arg,),
+            ResLimitFormat(ref arg) => write!(f, "Invalid format for resources limits: {}", arg,),
+            ResLimitValue(ref arg, ref err) => {
+                write!(f, "Invalid limit value for resource: {}: {}", arg, err)
+            }
             RmOldRootDir(ref err) => write!(f, "Failed to remove old jail root directory: {}", err),
             SetCurrentDir(ref err) => write!(f, "Failed to change current directory: {}", err),
             SetNetNs(ref err) => write!(f, "Failed to join network namespace: netns: {}", err),
+            Setrlimit(ref err) => write!(f, "Failed to set limit for resource: {}", err),
             SetSid(ref err) => write!(f, "Failed to daemonize: setsid: {}", err),
             Uid(ref uid) => write!(f, "Invalid uid: {}", uid),
             UmountOldRoot(ref err) => write!(f, "Failed to unmount the old jail root: {}", err),
@@ -200,9 +226,6 @@ impl fmt::Display for Error {
             }
             UnshareNewNs(ref err) => {
                 write!(f, "Failed to unshare into new mount namespace: {}", err)
-            }
-            UnshareNewPID(ref err) => {
-                write!(f, "Failed to unshare into new PID namespace: {}", err)
             }
             UnsetCloexec(ref err) => write!(
                 f,
@@ -235,12 +258,6 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                 .required(true)
                 .takes_value(true)
                 .help("File path to exec into."),
-        )
-        .arg(
-            Argument::new("node")
-                .required(false)
-                .takes_value(true)
-                .help("NUMA node to assign this microVM to."),
         )
         .arg(
             Argument::new("uid")
@@ -279,6 +296,26 @@ pub fn build_arg_parser() -> ArgParser<'static> {
              <cgroup_file>=<value> (e.g cpu.shares=10). This argument can be used \
              multiple times to add multiple cgroups.",
         ))
+        .arg(Argument::new("resource-limit").allow_multiple(true).help(
+            "Resource limit values to be set by the jailer. It must follow this format: \
+             <resource>=<value> (e.g no-file=1024). This argument can be used \
+             multiple times to add multiple resource limits. \
+             Current available resource values are:\n\
+             \t\tfsize: The maximum size in bytes for files created by the process.\n\
+             \t\tno-file: Specifies a value one greater than the maximum file descriptor number \
+             that can be opened by this process.",
+        ))
+        .arg(
+            Argument::new("cgroup-version")
+                .takes_value(true)
+                .default_value("1")
+                .help("Select the cgroup version used by the jailer."),
+        )
+        .arg(
+            Argument::new("parent-cgroup")
+                .takes_value(true)
+                .help("Parent cgroup in which the cgroup of this microvm will be placed."),
+        )
         .arg(
             Argument::new("version")
                 .takes_value(false)
@@ -325,6 +362,18 @@ fn sanitize_process() {
                 unsafe { libc::close(fd) };
             }
         }
+    }
+
+    // Cleanup environment variables
+    clean_env_vars();
+}
+
+fn clean_env_vars() {
+    // Remove environment variables received from
+    // the parent process so there are no leaks
+    // inside the jailer environment
+    for (key, _) in p_env::vars() {
+        p_env::remove_var(key);
     }
 }
 
@@ -389,6 +438,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::fs::File;
     use std::os::unix::io::IntoRawFd;
 
@@ -416,6 +466,25 @@ mod tests {
         }
 
         assert!(fs::remove_dir_all(tmp_dir_path).is_ok());
+    }
+
+    #[test]
+    fn test_clean_env_vars() {
+        let env_vars: [&str; 5] = ["VAR1", "VAR2", "VAR3", "VAR4", "VAR5"];
+
+        // Set environment variables
+        for env_var in env_vars.iter() {
+            env::set_var(env_var, "0");
+        }
+
+        // Cleanup the environment
+        clean_env_vars();
+
+        // Assert that the variables set beforehand
+        // do not exist anymore
+        for env_var in env_vars.iter() {
+            assert_eq!(env::var_os(env_var), None);
+        }
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -495,6 +564,10 @@ mod tests {
         assert_eq!(
             format!("{}", Error::ChdirNewRoot(io::Error::from_raw_os_error(42))),
             "Failed to chdir into chroot directory: No message of desired type (os error 42)"
+        );
+        assert_eq!(
+            format!("{}", Error::Clone(io::Error::from_raw_os_error(42))),
+            "Failed cloning into a new child process: No message of desired type (os error 42)",
         );
         assert_eq!(
             format!("{}", Error::CloseNetNsFd(io::Error::from_raw_os_error(42))),
@@ -606,10 +679,6 @@ mod tests {
             "/foo/bar is not a directory",
         );
         assert_eq!(
-            format!("{}", Error::NumaNode(id.to_string())),
-            "Invalid numa node: foobar",
-        );
-        assert_eq!(
             format!("{}", Error::OpenDevNull(io::Error::from_raw_os_error(42))),
             "Failed to open /dev/null: No message of desired type (os error 42)",
         );
@@ -643,6 +712,21 @@ mod tests {
             format!("Regex failed: {:?}", err_regex),
         );
         assert_eq!(
+            format!("{}", Error::ResLimitArgument("foo".to_string())),
+            "Invalid resource argument: foo",
+        );
+        assert_eq!(
+            format!("{}", Error::ResLimitFormat("foo".to_string())),
+            "Invalid format for resources limits: foo",
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                Error::ResLimitValue("foo".to_string(), "bar".to_string())
+            ),
+            "Invalid limit value for resource: foo: bar",
+        );
+        assert_eq!(
             format!("{}", Error::RmOldRootDir(io::Error::from_raw_os_error(42))),
             "Failed to remove old jail root directory: No message of desired type (os error 42)",
         );
@@ -653,6 +737,10 @@ mod tests {
         assert_eq!(
             format!("{}", Error::SetNetNs(io::Error::from_raw_os_error(42))),
             "Failed to join network namespace: netns: No message of desired type (os error 42)",
+        );
+        assert_eq!(
+            format!("{}", Error::Setrlimit("foobar".to_string())),
+            "Failed to set limit for resource: foobar",
         );
         assert_eq!(
             format!("{}", Error::SetSid(io::Error::from_raw_os_error(42))),
@@ -673,10 +761,6 @@ mod tests {
         assert_eq!(
             format!("{}", Error::UnshareNewNs(io::Error::from_raw_os_error(42))),
             "Failed to unshare into new mount namespace: No message of desired type (os error 42)",
-        );
-        assert_eq!(
-            format!("{}", Error::UnshareNewPID(io::Error::from_raw_os_error(42))),
-            "Failed to unshare into new PID namespace: No message of desired type (os error 42)",
         );
         assert_eq!(
             format!("{}", Error::UnsetCloexec(io::Error::from_raw_os_error(42))),

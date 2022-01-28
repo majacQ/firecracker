@@ -47,11 +47,15 @@ def _check_cpu_features_arm(test_microvm):
     "htt",
     [True, False],
 )
-def test_cpuid(test_microvm_with_ssh, network_config, num_vcpus, htt):
-    """Check the CPUID for a microvm with the specified config."""
-    vm = test_microvm_with_ssh
+def test_cpuid(test_microvm_with_api, network_config, num_vcpus, htt):
+    """
+    Check the CPUID for a microvm with the specified config.
+
+    @type: functional
+    """
+    vm = test_microvm_with_api
     vm.spawn()
-    vm.basic_config(vcpu_count=num_vcpus, ht_enabled=htt)
+    vm.basic_config(vcpu_count=num_vcpus, smt=htt)
     _tap, _, _ = vm.ssh_network_config(network_config, '1')
     vm.start()
     _check_cpuid_x86(vm, num_vcpus, "true" if num_vcpus > 1 else "false")
@@ -61,9 +65,13 @@ def test_cpuid(test_microvm_with_ssh, network_config, num_vcpus, htt):
     PLATFORM != "aarch64",
     reason="The CPU features on x86 are tested as part of the CPU templates."
 )
-def test_cpu_features(test_microvm_with_ssh, network_config):
-    """Check the CPU features for a microvm with the specified config."""
-    vm = test_microvm_with_ssh
+def test_cpu_features(test_microvm_with_api, network_config):
+    """
+    Check the CPU features for a microvm with the specified config.
+
+    @type: functional
+    """
+    vm = test_microvm_with_api
     vm.spawn()
     vm.basic_config()
     _tap, _, _ = vm.ssh_network_config(network_config, '1')
@@ -75,8 +83,9 @@ def test_cpu_features(test_microvm_with_ssh, network_config):
     PLATFORM != "x86_64",
     reason="The CPU brand string is masked only on x86_64."
 )
-def test_brand_string(test_microvm_with_ssh, network_config):
-    """Ensure good formatting for the guest band string.
+def test_brand_string(test_microvm_with_api, network_config):
+    """
+    Ensure good formatting for the guest brand string.
 
     * For Intel CPUs, the guest brand string should be:
         Intel(R) Xeon(R) Processor @ {host frequency}
@@ -86,8 +95,10 @@ def test_brand_string(test_microvm_with_ssh, network_config):
         AMD EPYC
     * For other CPUs, the guest brand string should be:
         ""
+
+    @type: functional
     """
-    cif = open('/proc/cpuinfo', 'r')
+    cif = open('/proc/cpuinfo', 'r', encoding='utf-8')
     host_brand_string = None
     while True:
         line = cif.readline()
@@ -99,7 +110,7 @@ def test_brand_string(test_microvm_with_ssh, network_config):
     cif.close()
     assert host_brand_string is not None
 
-    test_microvm = test_microvm_with_ssh
+    test_microvm = test_microvm_with_api
     test_microvm.spawn()
 
     test_microvm.basic_config(vcpu_count=1)
@@ -136,17 +147,17 @@ def test_brand_string(test_microvm_with_ssh, network_config):
     reason="CPU features are masked only on x86_64."
 )
 @pytest.mark.parametrize("cpu_template", ["T2", "C3"])
-def test_cpu_template(test_microvm_with_ssh, network_config, cpu_template):
-    """Check that AVX2 & AVX512 instructions are disabled.
-
-    This is a rather dummy test for checking that some features are not
-    exposed by mistake. It is a first step into checking the t2 & c3
-    templates. In a next iteration we should check **all** cpuid entries, not
-    just these features. We can achieve this with a template
-    containing all features on a t2/c3 instance and check that the cpuid in
-    the guest is an exact match of the template.
+def test_cpu_template(test_microvm_with_api, network_config, cpu_template):
     """
-    test_microvm = test_microvm_with_ssh
+    Test masked and enabled cpu features against the expected template.
+
+    This test checks that all expected masked features are not present in the
+    guest and that expected enabled features are present for each of the
+    supported CPU templates.
+
+    @type: functional
+    """
+    test_microvm = test_microvm_with_api
     test_microvm.spawn()
 
     test_microvm.basic_config(vcpu_count=1)
@@ -154,7 +165,6 @@ def test_cpu_template(test_microvm_with_ssh, network_config, cpu_template):
     response = test_microvm.machine_cfg.put(
         vcpu_count=1,
         mem_size_mib=256,
-        ht_enabled=False,
         cpu_template=cpu_template,
     )
     assert test_microvm.api_session.is_status_no_content(response.status_code)
@@ -168,21 +178,21 @@ def test_cpu_template(test_microvm_with_ssh, network_config, cpu_template):
         return
 
     assert test_microvm.api_session.is_status_no_content(
-            response.status_code)
+        response.status_code)
     check_masked_features(test_microvm, cpu_template)
     check_enabled_features(test_microvm, cpu_template)
 
 
 def check_masked_features(test_microvm, cpu_template):
-    """Check that AVX2 & AVX512 instructions are disabled."""
+    """Verify the masked features of the given template."""
     common_masked_features_lscpu = ["dtes64", "monitor", "ds_cpl", "tm2",
                                     "cnxt-id", "sdbg", "xtpr", "pdcm",
                                     "osxsave",
                                     "psn", "ds", "acpi", "tm", "ss", "pbe",
                                     "fpdp", "rdt_m", "rdt_a", "mpx", "avx512f",
                                     "intel_pt",
-                                    "avx512_vpopcntdq",
-                                    "3dnowprefetch", "pdpe1gb"]
+                                    "avx512_vpopcntdq", "avx512_vnni",
+                                    "3dnowprefetch", "pdpe1gb", "vmx", "umip"]
 
     common_masked_features_cpuid = {"SGX": "false", "HLE": "false",
                                     "RTM": "false", "RDSEED": "false",
@@ -197,11 +207,13 @@ def check_masked_features(test_microvm, cpu_template):
                                     "AVX512_4VNNIW": "false",
                                     "AVX512_4FMAPS": "false",
                                     "XSAVEC": "false", "XGETBV": "false",
-                                    "XSAVES": "false"}
+                                    "XSAVES": "false", "UMIP": "false",
+                                    "VMX": "false"}
 
     # These are all discoverable by cpuid -1.
     c3_masked_features = {"FMA": "false", "MOVBE": "false", "BMI": "false",
                           "AVX2": "false", "BMI2": "false", "INVPCID": "false"}
+
     # Check that all common features discoverable with lscpu
     # are properly masked.
     ssh_connection = net_tools.SSHConnection(test_microvm.ssh_config)

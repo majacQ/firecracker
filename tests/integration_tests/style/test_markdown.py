@@ -2,11 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for markdown style checks."""
 
-import framework.utils as utils
+from framework import utils
 
 
 def test_markdown_style():
-    """Fail if there's misbehaving markdown style in the test system."""
+    """
+    Test that markdown files adhere to the style rules.
+
+    @type: style
+    """
     # Get all *.md files from the project
     md_files = utils.get_files_from(
         find_path="..",

@@ -1,6 +1,8 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![doc(hidden)]
+
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,7 +21,7 @@ macro_rules! check_metric_after_block {
 }
 
 pub fn default_mem() -> GuestMemoryMmap {
-    GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap()
+    vm_memory::test_utils::create_anon_guest_memory(&[(GuestAddress(0), 0x10000)], false).unwrap()
 }
 
 pub fn initialize_virtqueue(vq: &VirtQueue) {

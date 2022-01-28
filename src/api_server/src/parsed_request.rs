@@ -19,14 +19,16 @@ use crate::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use crate::request::net::{parse_patch_net, parse_put_net};
 use crate::request::snapshot::parse_patch_vm_state;
 use crate::request::snapshot::parse_put_snapshot;
+use crate::request::version::parse_get_version;
 use crate::request::vsock::parse_put_vsock;
 use crate::ApiServer;
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
 
 use logger::{error, info};
+use std::os::unix::io::IntoRawFd;
 use vmm::rpc_interface::{VmmAction, VmmActionError};
 
-pub(crate) enum ParsedRequest {
+pub(crate) enum RequestAction {
     GetMMDS,
     PatchMMDS(Value),
     PutMMDS(Value),
@@ -34,7 +36,46 @@ pub(crate) enum ParsedRequest {
     ShutdownInternal, // !!! not an API, used by shutdown to thread::join the API thread
 }
 
+#[derive(Default)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) struct ParsingInfo {
+    deprecation_message: Option<String>,
+}
+
+impl ParsingInfo {
+    pub fn append_deprecation_message(&mut self, message: &str) {
+        match self.deprecation_message.as_mut() {
+            None => self.deprecation_message = Some(message.to_owned()),
+            Some(s) => (*s).push_str(message),
+        }
+    }
+
+    pub fn take_deprecation_message(&mut self) -> Option<String> {
+        self.deprecation_message.take()
+    }
+}
+
+pub(crate) struct ParsedRequest {
+    action: RequestAction,
+    parsing_info: ParsingInfo,
+}
+
 impl ParsedRequest {
+    pub(crate) fn new(action: RequestAction) -> Self {
+        Self {
+            action,
+            parsing_info: Default::default(),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (RequestAction, ParsingInfo) {
+        (self.action, self.parsing_info)
+    }
+
+    pub(crate) fn parsing_info(&mut self) -> &mut ParsingInfo {
+        &mut self.parsing_info
+    }
+
     pub(crate) fn try_from_request(request: &Request) -> Result<ParsedRequest, Error> {
         let request_uri = request.uri().get_abs_path().to_string();
         log_received_api_request(describe(
@@ -59,6 +100,7 @@ impl ParsedRequest {
         match (request.method(), path, request.body.as_ref()) {
             (Method::Get, "", None) => parse_get_instance_info(),
             (Method::Get, "balloon", None) => parse_get_balloon(path_tokens.get(1)),
+            (Method::Get, "version", None) => parse_get_version(),
             (Method::Get, "vm", None) if path_tokens.get(1) == Some(&"config") => {
                 Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig))
             }
@@ -76,7 +118,9 @@ impl ParsedRequest {
             (Method::Put, "network-interfaces", Some(body)) => {
                 parse_put_net(body, path_tokens.get(1))
             }
-            (Method::Put, "shutdown-internal", None) => Ok(ParsedRequest::ShutdownInternal),
+            (Method::Put, "shutdown-internal", None) => {
+                Ok(ParsedRequest::new(RequestAction::ShutdownInternal))
+            }
             (Method::Put, "snapshot", Some(body)) => parse_put_snapshot(body, path_tokens.get(1)),
             (Method::Put, "vsock", Some(body)) => parse_put_vsock(body),
             (Method::Put, _, None) => method_to_error(Method::Put),
@@ -95,7 +139,7 @@ impl ParsedRequest {
         }
     }
 
-    fn success_response_with_data<T>(body_data: &T) -> Response
+    pub(crate) fn success_response_with_data<T>(body_data: &T) -> Response
     where
         T: ?Sized + Serialize,
     {
@@ -106,7 +150,7 @@ impl ParsedRequest {
     }
 
     pub(crate) fn convert_to_response(
-        request_outcome: &std::result::Result<VmmData, VmmActionError>,
+        request_outcome: std::result::Result<VmmData, VmmActionError>,
     ) -> Response {
         match request_outcome {
             Ok(vmm_data) => match vmm_data {
@@ -115,14 +159,38 @@ impl ParsedRequest {
                     Response::new(Version::Http11, StatusCode::NoContent)
                 }
                 VmmData::MachineConfiguration(vm_config) => {
-                    Self::success_response_with_data(vm_config)
+                    Self::success_response_with_data(&vm_config)
                 }
                 VmmData::BalloonConfig(balloon_config) => {
-                    Self::success_response_with_data(balloon_config)
+                    Self::success_response_with_data(&balloon_config)
                 }
+                VmmData::BalloonStats(stats) => Self::success_response_with_data(&stats),
+                VmmData::InstanceInformation(info) => Self::success_response_with_data(&info),
+                VmmData::FullVmConfig(config) => Self::success_response_with_data(&config),
+                VmmData::UffdBackendDescription(desc) => {
+                    info!("API responding with uufd backend description");
+                    // FIXME: "201 Created" http response code is better than "200 OK" here.
+                    let mut resp = Self::success_response_with_data(&desc);
+                    // TODO: we're leaking the FD here in firecracker process; but we leak it to
+                    // keep it open until the other end takes ownership of a copy.
+                    // To not leak it, we'd have to introduce another signal between the two
+                    // processes so we know when it's ok to drop.
+                    // All the extra complexity is not worth the effort in firecracker case, it's
+                    // ok to just keep this one FD open/leaked until end of process.
+                    // TODO: we could try to send `File` to microhttp and drop it after `sendmsg`.
+                    // resp.file = desc.uffd.map(|inner| inner.into_raw_fd());
+                    resp.file = Some(desc.uffd.into_raw_fd());
+                    resp
+                }
+  <<<<<<< feature/uffd-on-snaps-response
+  =======
                 VmmData::BalloonStats(stats) => Self::success_response_with_data(stats),
                 VmmData::InstanceInformation(info) => Self::success_response_with_data(info),
+                VmmData::VmmVersion(version) => Self::success_response_with_data(
+                    &serde_json::json!({ "firecracker_version": version.as_str() }),
+                ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
+  >>>>>>> main
             },
             Err(vmm_action_error) => {
                 error!(
@@ -140,7 +208,7 @@ impl ParsedRequest {
 
     /// Helper function to avoid boiler-plate code.
     pub(crate) fn new_sync(vmm_action: VmmAction) -> ParsedRequest {
-        ParsedRequest::Sync(Box::new(vmm_action))
+        ParsedRequest::new(RequestAction::Sync(Box::new(vmm_action)))
     }
 }
 
@@ -276,25 +344,43 @@ pub(crate) mod tests {
 
     impl PartialEq for ParsedRequest {
         fn eq(&self, other: &ParsedRequest) -> bool {
-            match (self, other) {
-                (&ParsedRequest::Sync(ref sync_req), &ParsedRequest::Sync(ref other_sync_req)) => {
+            if self.parsing_info.deprecation_message != other.parsing_info.deprecation_message {
+                return false;
+            }
+
+            match (&self.action, &other.action) {
+                (RequestAction::Sync(ref sync_req), RequestAction::Sync(ref other_sync_req)) => {
                     sync_req == other_sync_req
                 }
-                (&ParsedRequest::GetMMDS, &ParsedRequest::GetMMDS) => true,
-                (&ParsedRequest::PutMMDS(ref val), &ParsedRequest::PutMMDS(ref other_val)) => {
+                (RequestAction::GetMMDS, RequestAction::GetMMDS) => true,
+                (RequestAction::PutMMDS(ref val), RequestAction::PutMMDS(ref other_val)) => {
                     val == other_val
                 }
-                (&ParsedRequest::PatchMMDS(ref val), &ParsedRequest::PatchMMDS(ref other_val)) => {
+                (RequestAction::PatchMMDS(ref val), RequestAction::PatchMMDS(ref other_val)) => {
                     val == other_val
                 }
+
                 _ => false,
             }
         }
     }
 
     pub(crate) fn vmm_action_from_request(req: ParsedRequest) -> VmmAction {
-        match req {
-            ParsedRequest::Sync(vmm_action) => *vmm_action,
+        match req.action {
+            RequestAction::Sync(vmm_action) => *vmm_action,
+            _ => panic!("Invalid request"),
+        }
+    }
+
+    pub(crate) fn depr_action_from_req(req: ParsedRequest, msg: Option<String>) -> VmmAction {
+        let (action_req, mut parsing_info) = req.into_parts();
+        match action_req {
+            RequestAction::Sync(vmm_action) => {
+                let req_msg = parsing_info.take_deprecation_message();
+                assert!(req_msg.is_some());
+                assert_eq!(req_msg, msg);
+                *vmm_action
+            }
             _ => panic!("Invalid request"),
         }
     }
@@ -514,6 +600,10 @@ pub(crate) mod tests {
                 VmmData::InstanceInformation(info) => {
                     http_response(&serde_json::to_string(info).unwrap(), 200)
                 }
+                VmmData::VmmVersion(version) => http_response(
+                    &serde_json::json!({ "firecracker_version": version.as_str() }).to_string(),
+                    200,
+                ),
             };
             let response = ParsedRequest::convert_to_response(&data);
             assert!(response.write_all(&mut buf).is_ok());
@@ -530,6 +620,7 @@ pub(crate) mod tests {
         verify_ok_response_with(VmmData::FullVmConfig(VmmConfig::default()));
         verify_ok_response_with(VmmData::MachineConfiguration(VmConfig::default()));
         verify_ok_response_with(VmmData::InstanceInformation(InstanceInfo::default()));
+        verify_ok_response_with(VmmData::VmmVersion(String::default()));
 
         // Error.
         let error = VmmActionError::StartMicrovm(StartMicrovmError::MissingKernelConfig);
@@ -603,6 +694,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_try_from_get_version() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/version", None).as_bytes())
+            .unwrap();
+        assert!(connection.try_read().is_ok());
+        let req = connection.pop_parsed_request().unwrap();
+        assert!(ParsedRequest::try_from_request(&req).is_ok());
+    }
+
+    #[test]
     fn test_try_from_put_actions() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
         let mut connection = HttpConnection::new(receiver);
@@ -661,6 +764,7 @@ pub(crate) mod tests {
             \"partuuid\": \"string\", \
             \"is_read_only\": true, \
             \"cache_type\": \"Unsafe\", \
+            \"io_engine\": \"Sync\", \
             \"rate_limiter\": { \
                 \"bandwidth\": { \
                     \"size\": 0, \
@@ -706,8 +810,7 @@ pub(crate) mod tests {
         let mut connection = HttpConnection::new(receiver);
         let body = "{ \
             \"vcpu_count\": 0, \
-            \"mem_size_mib\": 0, \
-            \"ht_enabled\": true \
+            \"mem_size_mib\": 0 \
         }";
         sender
             .write_all(http_request("PUT", "/machine-config", Some(&body)).as_bytes())
@@ -736,15 +839,30 @@ pub(crate) mod tests {
     fn test_try_from_put_mmds() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
         let mut connection = HttpConnection::new(receiver);
+
+        // `/mmds`
         sender
             .write_all(http_request("PUT", "/mmds", Some(&"{}")).as_bytes())
             .unwrap();
         assert!(connection.try_read().is_ok());
         let req = connection.pop_parsed_request().unwrap();
         assert!(ParsedRequest::try_from_request(&req).is_ok());
-        let body = "{\"ipv4_address\":\"169.254.170.2\"}";
+
+        let body = "{\"foo\":\"bar\"}";
         sender
             .write_all(http_request("PUT", "/mmds", Some(&body)).as_bytes())
+            .unwrap();
+        assert!(connection.try_read().is_ok());
+        let req = connection.pop_parsed_request().unwrap();
+        assert!(ParsedRequest::try_from_request(&req).is_ok());
+
+        // `/mmds/config`
+        let body = "{ \
+            \"ipv4_address\": \"169.254.170.2\", \
+            \"network_interfaces\": [\"iface0\"] \
+        }";
+        sender
+            .write_all(http_request("PUT", "/mmds/config", Some(&body)).as_bytes())
             .unwrap();
         assert!(connection.try_read().is_ok());
         let req = connection.pop_parsed_request().unwrap();
@@ -759,7 +877,6 @@ pub(crate) mod tests {
             \"iface_id\": \"string\", \
             \"guest_mac\": \"12:34:56:78:9a:BC\", \
             \"host_dev_name\": \"string\", \
-            \"allow_mmds_requests\": true, \
             \"rx_rate_limiter\": { \
                 \"bandwidth\": { \
                     \"size\": 0, \
@@ -831,8 +948,8 @@ pub(crate) mod tests {
             .unwrap();
         assert!(connection.try_read().is_ok());
         let req = connection.pop_parsed_request().unwrap();
-        match ParsedRequest::try_from_request(&req).unwrap() {
-            ParsedRequest::ShutdownInternal => (),
+        match ParsedRequest::try_from_request(&req).unwrap().into_parts() {
+            (RequestAction::ShutdownInternal, _) => (),
             _ => panic!("wrong parsed request"),
         };
     }
@@ -913,8 +1030,7 @@ pub(crate) mod tests {
         let mut connection = HttpConnection::new(receiver);
         let body = "{ \
             \"vcpu_count\": 0, \
-            \"mem_size_mib\": 0, \
-            \"ht_enabled\": true \
+            \"mem_size_mib\": 0 \
         }";
         sender
             .write_all(http_request("PATCH", "/machine-config", Some(&body)).as_bytes())
@@ -925,7 +1041,7 @@ pub(crate) mod tests {
         let body = "{ \
             \"vcpu_count\": 0, \
             \"mem_size_mib\": 0, \
-            \"ht_enabled\": true, \
+            \"smt\": false, \
             \"cpu_template\": \"C3\" \
         }";
         sender

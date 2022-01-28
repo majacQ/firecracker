@@ -9,9 +9,9 @@ import json
 import shutil
 
 import pytest
-import framework.utils as utils
-import host_tools.proc as proc
+from framework import utils
 from framework.defs import FC_WORKSPACE_DIR
+from host_tools import proc
 
 BENCHMARK_DIRECTORY = "{}/src/vmm".format(FC_WORKSPACE_DIR)
 
@@ -27,7 +27,7 @@ BASELINES = {
                 "delta": 0.025  # milliseconds
             },
             "crc": {
-                "target": 0.213,  # milliseconds
+                "target": 0.205,  # milliseconds
                 "delta": 0.025  # milliseconds
             }
         },
@@ -55,11 +55,11 @@ BASELINES = {
         },
         "deserialize": {
             "no-crc": {
-                "target": 0.034,  # milliseconds
+                "target": 0.037,  # milliseconds
                 "delta": 0.015  # milliseconds
             },
             "crc": {
-                "target": 0.042,  # milliseconds
+                "target": 0.045,  # milliseconds
                 "delta": 0.015  # milliseconds
             }
         }
@@ -109,13 +109,19 @@ def _check_statistics(directory, mean):
     assert low <= mean <= high, "Benchmark result {} has changed!" \
         .format(directory)
 
+    return directory, f"{mean} ms", f"{low} <= result <= {high}"
+
 
 @pytest.mark.skipif(
     platform.machine() != "x86_64",
     reason="Not supported yet."
 )
 def test_serialization_benchmark():
-    """Benchmark test for MicrovmState serialization/deserialization."""
+    """
+    Benchmark test for MicrovmState serialization/deserialization.
+
+    @type: performance
+    """
     logger = logging.getLogger("serialization_benchmark")
 
     # Move into the benchmark directory
@@ -125,6 +131,8 @@ def test_serialization_benchmark():
     cmd = 'cargo bench'
     result = utils.run_cmd_sync(cmd)
     assert result.returncode == 0
+
+    results_and_criteria = ["", ""]
 
     # Parse each Criterion benchmark from the result folder and
     # check the results against a baseline
@@ -140,14 +148,20 @@ def test_serialization_benchmark():
         json_file = os.path.join(
             results_dir,
             "{}/{}".format(directory, "base/estimates.json"))
-        with open(json_file, "r") as read_file:
+        with open(json_file, "r", encoding='utf-8') as read_file:
             estimates = json.load(read_file)
 
         # Save the Mean measurement(nanoseconds) and transform it(milliseconds)
         mean = estimates['mean']['point_estimate'] / NSEC_IN_MSEC
         logger.info("Mean: %f", mean)
 
-        _check_statistics(directory, mean)
+        res = _check_statistics(directory, mean)
+
+        results_and_criteria[0] += f"{res[0]}: {res[1]}, "
+        results_and_criteria[1] += f"{res[0]}: {res[2]}, "
 
     # Cleanup the Target directory
     shutil.rmtree(results_dir)
+
+    # Return pretty formatted data for the test report.
+    return results_and_criteria[0], results_and_criteria[1]

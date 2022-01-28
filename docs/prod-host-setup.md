@@ -1,5 +1,10 @@
 # Production Host Setup Recommendations
 
+Firecracker relies on KVM and on the processor virtualization features
+for workload isolation. Security guarantees and defense in depth can only be
+upheld, if the following list of recommendations are implemented in
+production.
+
 ## Firecracker Configuration
 
 ### Seccomp
@@ -77,8 +82,12 @@ for Firecracker processes that are unresponsive, and kills them, by SIGKILL.
 
 ## Jailer Configuration
 
-Using Jailer in a production Firecracker deployment is highly recommended,
-as it provides additional security boundaries for the microVM.
+For assuring secure isolation in production deployments, Firecracker should
+must be started using the `jailer` binary that's part of each Firecracker
+release, or executed under process constraints equal or more restrictive than
+those in the jailer. For more about Firecracker sandboxing please see
+[Firecracker design](design.md)
+
 The Jailer process applies
 [cgroup](https://www.kernel.org/doc/Documentation/cgroup-v1/cgroups.txt),
 namespace isolation and drops privileges of the Firecracker process.
@@ -97,10 +106,115 @@ To set up the jailer correctly, you'll need to:
   their individually owned resources in the unlikely case where any one of the
   jails is broken out of.
 
+Firecracker's customers are strongly advised to use the provided
+`resource-limits` and `cgroup` functionalities encapsulated within jailer,
+in order to control Firecracker's resource consumption in a way that makes
+the most sense to their specific workload. While aiming to provide as much
+control as possible, we cannot enforce aggressive default constraints
+resources such as memory or CPU because these are highly dependent on the
+workload type and usecase.
+
+Here are some recommendations on how to limit the process's resources:
+
+### Disk
+
+- `cgroup` provides a
+  [Block IO Controller](https://www.kernel.org/doc/Documentation/cgroup-v1/blkio-controller.txt)
+  which allows users to control I/O operations through the following files:
+  - `blkio.throttle.io_serviced` - bounds the number of I/Os issued to disk
+  - `blkio.throttle.io_service_bytes` - sets a limit on the number of bytes
+    transferred to/from the disk
+
+- Jailer's `resource-limit` provides control on the disk usage through:
+  - `fsize` - limits the size in bytes for files created by the process
+  - `no-file` - specifies a value one greater than the maximum file
+    descriptor number that can be opened by the process. If not specified,
+    it defaults to 4096.
+
+### Memory
+
+- `cgroup` provides a
+  [Memory Resource Controller](https://www.kernel.org/doc/Documentation/cgroup-v1/memory.txt)
+  to allow setting upper limits to memory usage:
+  - `memory.limit_in_bytes` - bounds the memory usage
+  - `memory.memsw.limit_in_bytes` - limits the memory+swap usage
+  - `memory.soft_limit_in_bytes` -  enables flexible sharing of memory. Under
+    normal circumstances, control groups are allowed to use as much of the
+    memory as needed, constrained only by their hard limits set with the
+    `memory.limit_in_bytes` parameter. However, when the system detects
+    memory contention or low memory, control groups are forced to restrict
+    their consumption to their soft limits.
+
+### vCPU
+
+- `cgroup`’s
+  [CPU Controller](https://www.kernel.org/doc/Documentation/cgroup-v1/cpuacct.txt)
+  can guarantee a minimum number of CPU shares when a system is busy and
+  provides CPU bandwidth control through:
+  - `cpu.shares` - limits the amount of CPU that each group it is expected to
+    get. The percentage of CPU assigned is the value of shares divided by the
+    sum of all shares in all `cgroups` in the same level
+  - `cpu.cfs_period_us` - bounds the duration in us of each scheduler period,
+    for bandwidth decisions. This defaults to 100ms
+  - `cpu.cfs_quota_us` - sets the maximum time in microseconds during each
+    `cfs_period_us` for which the current group will be allowed to run
+  - `cpuacct.usage_percpu` - limits the CPU time, in ns, consumed by the
+    process in the group, separated by CPU
+
 Additional details of Jailer features can be found in the
 [Jailer documentation](jailer.md).
 
 ## Host Security Configuration
+
+### Constrain CPU overhead caused by kvm-pit kernel threads
+
+The current implementation results in host CPU usage increase on x86 CPUs when
+a guest injects timer interrupts with the help of kvm-pit kernel thread.
+kvm-pit kthread is by default part of the root cgroup.
+
+To mitigate the CPU overhead we recommend two system level configurations.
+
+1.
+    Use an external agent to move the `kvm-pit/<pid of firecracker>` kernel
+    thread in the microVM’s cgroup (e.g., created by the Jailer).
+    This cannot be done by Firecracker since the thread is created by the Linux
+    kernel after guest start, at which point Firecracker is de-privileged.
+1.
+    Configure the kvm limit to a lower value. This is a system-wide
+    configuration available to users without Firecracker or Jailer changes.
+    However, the same limit applies to APIC timer events, and users will need
+    to test their workloads in order to apply this mitigation.
+
+To modify the kvm limit for interrupts that can be injected in a second.
+
+1. `sudo modprobe -r (kvm_intel|kvm_amd) kvm`
+1. `sudo modprobe kvm min_timer_period_us={new_value}`
+1. `sudo modprobe (kvm_intel|kvm_amd)`
+
+To have this change persistent across boots we can append the option to
+`/etc/modprobe.d/kvm.conf`:
+
+`echo "options kvm min_timer_period_us=" >> /etc/modprobe.d/kvm.conf`
+
+### Mitigating Network flooding issues
+
+Network can be flooded by creating connections and sending/receiving a
+significant amount of requests. This issue can be mitigated either by
+configuring rate limiters for the network interface as explained within
+[Network Interface documentation](api_requests/patch-network-interface.md),
+or by using one of the tools presented below:
+
+- `tc qdisk` - manipulate traffic control settings by configuring filters.
+
+When traffic enters a classful qdisc, the filters are consulted and the
+packet is enqueued into one of the classes within. Besides
+containing other qdiscs, most classful qdiscs perform rate control.
+
+- `netnamespace` and `iptables`
+  - `--pid-owner` -  can be used to match packets based on the PID that was
+    responsible for them
+  - `connlimit` - restricts the number of connections for a destination IP
+    address/from a source IP address, as well as limit the bandwidth
 
 ### Mitigating Side-Channel Issues
 
@@ -259,7 +373,7 @@ spec_store_bypass_disable=seccomp
 which will apply SSB if seccomp is enabled by Firecracker.
 
 On aarch64 systems, it is enabled by Firecracker
-[using the `prctl` interface][3]. However, this is only availabe on host
+[using the `prctl` interface][3]. However, this is only available on host
 kernels Linux >=4.17 and also Amazon Linux 4.14. Alternatively, a global
 mitigation can be enabled by adding the following Linux kernel boot parameter:
 

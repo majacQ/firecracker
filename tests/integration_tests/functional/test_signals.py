@@ -12,7 +12,7 @@ import resource as res
 import pytest
 
 import host_tools.network as net_tools
-import framework.utils as utils
+from framework import utils
 
 signum_str = {
     SIGBUS: "sigbus",
@@ -31,7 +31,11 @@ signum_str = {
     [SIGBUS, SIGSEGV, SIGXFSZ, SIGXCPU, SIGPIPE, SIGHUP, SIGILL, SIGSYS]
 )
 def test_generic_signal_handler(test_microvm_with_api, signum):
-    """Test signal handling for all handled signals."""
+    """
+    Test signal handling for all handled signals.
+
+    @type: functional
+    """
     microvm = test_microvm_with_api
     microvm.spawn()
 
@@ -53,7 +57,7 @@ def test_generic_signal_handler(test_microvm_with_api, signum):
     sleep(0.5)
 
     metrics_jail_path = os.path.join(microvm.chroot(), metrics_path)
-    metrics_fd = open(metrics_jail_path)
+    metrics_fd = open(metrics_jail_path, encoding='utf-8')
 
     line_metrics = metrics_fd.readlines()
     assert len(line_metrics) == 1
@@ -80,14 +84,21 @@ def test_generic_signal_handler(test_microvm_with_api, signum):
 
 
 def test_sigxfsz_handler(test_microvm_with_api):
-    """Test intercepting and handling SIGXFSZ."""
+    """
+    Test intercepting and handling SIGXFSZ.
+
+    @type: functional
+    """
     microvm = test_microvm_with_api
     microvm.spawn()
 
     # We don't need to monitor the memory for this test.
     microvm.memory_monitor = None
 
-    microvm.basic_config()
+    # We need to use the Sync file engine type. If we use io_uring we will not
+    # get a SIGXFSZ. We'll instead get an errno 27 File too large as the
+    # completed entry status code.
+    microvm.basic_config(rootfs_io_engine="Sync")
 
     # Configure metrics based on a file.
     metrics_path = os.path.join(microvm.path, 'metrics_fifo')
@@ -101,7 +112,7 @@ def test_sigxfsz_handler(test_microvm_with_api):
 
     metrics_jail_path = os.path.join(microvm.jailer.chroot_path(),
                                      metrics_path)
-    metrics_fd = open(metrics_jail_path)
+    metrics_fd = open(metrics_jail_path, encoding='utf-8')
     line_metrics = metrics_fd.readlines()
     assert len(line_metrics) == 1
 
@@ -127,9 +138,13 @@ def test_sigxfsz_handler(test_microvm_with_api):
     assert metric_line["signals"]["sigxfsz"] == 1
 
 
-def test_handled_signals(test_microvm_with_ssh, network_config):
-    """Test that handled signals don't kill the microVM."""
-    microvm = test_microvm_with_ssh
+def test_handled_signals(test_microvm_with_api, network_config):
+    """
+    Test that handled signals don't kill the microVM.
+
+    @type: functional
+    """
+    microvm = test_microvm_with_api
     microvm.spawn()
 
     # We don't need to monitor the memory for this test.

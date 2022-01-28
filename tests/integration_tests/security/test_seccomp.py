@@ -6,11 +6,9 @@ import json as json_lib
 import os
 import tempfile
 import platform
-import time
-import pytest
 
 from host_tools.cargo_build import run_seccompiler_bin
-import framework.utils as utils
+from framework import utils
 
 
 def _get_basic_syscall_list():
@@ -86,7 +84,11 @@ def _run_seccompiler_bin(json_data, basic=False):
 
 
 def test_seccomp_ls(bin_seccomp_paths):
-    """Assert that the seccomp filter denies an unallowed syscall."""
+    """
+    Assert that the seccomp filter denies an unallowed syscall.
+
+    @type: security
+    """
     # pylint: disable=redefined-outer-name
     # pylint: disable=subprocess-run-check
     # The fixture pattern causes a pylint false positive for that rule.
@@ -129,6 +131,8 @@ def test_advanced_seccomp(bin_seccomp_paths):
     Test that the demo jailer (with advanced seccomp) allows the harmless demo
     binary, denies the malicious demo binary and that an empty allowlist
     denies everything.
+
+    @type: security
     """
     # pylint: disable=redefined-outer-name
     # pylint: disable=subprocess-run-check
@@ -230,7 +234,11 @@ def test_advanced_seccomp(bin_seccomp_paths):
 
 
 def test_no_seccomp(test_microvm_with_api):
-    """Test Firecracker --no-seccomp."""
+    """
+    Test that Firecracker --no-seccomp installs no filter.
+
+    @type: security
+    """
     test_microvm = test_microvm_with_api
     test_microvm.jailer.extra_args.update({"no-seccomp": None})
     test_microvm.spawn()
@@ -242,48 +250,21 @@ def test_no_seccomp(test_microvm_with_api):
     utils.assert_seccomp_level(test_microvm.jailer_clone_pid, "0")
 
 
-# The possible Firecracker --seccomp-level values.
-# "default" stands for no custom parameter.
-SECCOMP_LEVELS = ["default", "0", "1", "2"]
+def test_default_seccomp_level(test_microvm_with_api):
+    """
+    Test that Firecracker installs a seccomp filter by default.
 
-# Map FC seccomp-level to kernel seccomp-level.
-# Note that level 1 also maps to kernel level 2, which stands for
-# any custom BPF filter.
-# The default is 2.
-KERNEL_LEVEL = {"default": "2", "0": "0", "1": "2", "2": "2"}
-
-
-@pytest.mark.parametrize(
-    "level",
-    SECCOMP_LEVELS
-)
-def test_seccomp_level(test_microvm_with_api, level):
-    """Test Firecracker --seccomp-level value."""
+    @type: security
+    """
     test_microvm = test_microvm_with_api
-    test_microvm.jailer.daemonize = False
-
-    if level != "default":
-        test_microvm.jailer.extra_args.update({"seccomp-level": level})
-
-    test_microvm.spawn(create_logger=False)
+    test_microvm.spawn()
 
     test_microvm.basic_config()
 
     test_microvm.start()
 
     utils.assert_seccomp_level(
-        test_microvm.jailer_clone_pid, KERNEL_LEVEL[level])
-
-    test_microvm.kill()
-
-    # For seccomp-level, check that we output the deprecation warnings.
-    if level != "default":
-        time.sleep(0.5)
-        with open(test_microvm.screen_log, 'r') as file:
-            log_data = file.read()
-            assert "You are using a deprecated parameter: --seccomp-level " \
-                f"{level}, that will be removed in a future version." \
-                in log_data
+        test_microvm.jailer_clone_pid, "2")
 
 
 def test_seccomp_rust_panic(bin_seccomp_paths):
@@ -292,6 +273,8 @@ def test_seccomp_rust_panic(bin_seccomp_paths):
 
     Test that the Firecracker filters allow a Rust panic to run its
     course without triggering a seccomp violation.
+
+    @type: security
     """
     # pylint: disable=redefined-outer-name
     # pylint: disable=subprocess-run-check
@@ -303,7 +286,7 @@ def test_seccomp_rust_panic(bin_seccomp_paths):
     fc_filters_path = "../resources/seccomp/{}-unknown-linux-musl.json".format(
         platform.machine()
     )
-    with open(fc_filters_path, "r") as fc_filters:
+    with open(fc_filters_path, "r", encoding='utf-8') as fc_filters:
         filter_threads = list(json_lib.loads(fc_filters.read()))
 
     bpf_temp = tempfile.NamedTemporaryFile(delete=False)

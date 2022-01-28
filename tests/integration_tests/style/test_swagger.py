@@ -4,12 +4,12 @@
 
 import os
 import yaml
-import framework.utils as utils
+from framework import utils
 
 
 def check_yaml_style(yaml_spec):
     """Check if the swagger definition is correctly formatted."""
-    with open(yaml_spec, 'r') as file_stream:
+    with open(yaml_spec, 'r', encoding='utf-8') as file_stream:
         try:
             yaml.safe_load(file_stream)
         # pylint: disable=broad-except
@@ -28,7 +28,11 @@ def validate_swagger(swagger_spec):
 
 
 def test_firecracker_swagger():
-    """Fail if Firecracker swagger specification is malformed."""
+    """
+    Test that Firecracker swagger specification is valid.
+
+    @type: style
+    """
     swagger_spec = os.path.normpath(
         os.path.join(os.getcwd(), '../src/api_server/swagger/firecracker.yaml')
     )

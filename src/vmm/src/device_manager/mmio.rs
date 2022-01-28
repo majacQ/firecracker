@@ -5,13 +5,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+#[cfg(target_arch = "aarch64")]
+use devices::legacy::SerialDevice;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
+#[cfg(target_arch = "x86_64")]
+use vm_memory::GuestAddress;
 
 #[cfg(target_arch = "aarch64")]
 use arch::aarch64::DeviceInfoForFDT;
 use arch::DeviceType;
+use arch::DeviceType::Virtio;
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::RTCDevice;
 use devices::pseudo::BootTimer;
@@ -20,8 +25,8 @@ use devices::virtio::{
     TYPE_VSOCK,
 };
 use devices::BusDevice;
-use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};
+use linux_loader::cmdline as kernel_cmdline;
 use logger::info;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
@@ -32,7 +37,7 @@ pub enum Error {
     /// Failed to perform an operation on the bus.
     BusError(devices::BusError),
     /// Appending to kernel command line failed.
-    Cmdline(kernel_cmdline::Error),
+    Cmdline(linux_loader::cmdline::Error),
     /// The device couldn't be found.
     DeviceNotFound,
     /// Failure in creating or cloning an event fd.
@@ -226,10 +231,7 @@ impl MMIODeviceManager {
         // bytes to 1024; further, the '{}' formatting rust construct will automatically
         // transform it to decimal
         cmdline
-            .insert(
-                "virtio_mmio.device",
-                &format!("{}K@0x{:08x}:{}", slot.len / 1024, slot.addr, slot.irqs[0]),
-            )
+            .add_virtio_mmio_device(slot.len, GuestAddress(slot.addr), slot.irqs[0], None)
             .map_err(Error::Cmdline)
     }
 
@@ -255,13 +257,13 @@ impl MMIODeviceManager {
     pub fn register_mmio_serial(
         &mut self,
         vm: &VmFd,
-        serial: Arc<Mutex<devices::legacy::Serial>>,
+        serial: Arc<Mutex<SerialDevice>>,
         dev_info_opt: Option<MMIODeviceInfo>,
     ) -> Result<()> {
         let slot = dev_info_opt.unwrap_or(self.allocate_new_slot(1)?);
 
         vm.register_irqfd(
-            &serial.lock().expect("Poisoned lock").interrupt_evt(),
+            &serial.lock().expect("Poisoned lock").serial.interrupt_evt(),
             slot.irqs[0],
         )
         .map_err(Error::RegisterIrqFd)?;
@@ -291,9 +293,7 @@ impl MMIODeviceManager {
         dev_info_opt: Option<MMIODeviceInfo>,
     ) -> Result<()> {
         // Create and attach a new RTC device.
-        // We allocate an IRQ even though we do not need it so that
-        // we do not break snapshot compatibility.
-        let slot = dev_info_opt.unwrap_or(self.allocate_new_slot(1)?);
+        let slot = dev_info_opt.unwrap_or(self.allocate_new_slot(0)?);
 
         let identifier = (DeviceType::Rtc, DeviceType::Rtc.to_string());
         self.register_mmio_device(identifier, slot, rtc)
@@ -360,6 +360,33 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    /// Run fn for each registered virtio device.
+    pub fn for_each_virtio_device<F, E>(&self, mut f: F) -> std::result::Result<(), E>
+    where
+        F: FnMut(
+            u32,
+            &String,
+            &MMIODeviceInfo,
+            Arc<Mutex<dyn VirtioDevice>>,
+        ) -> std::result::Result<(), E>,
+    {
+        self.for_each_device(|device_type, device_id, device_info, bus_device| {
+            if let Virtio(virtio_type) = device_type {
+                let virtio_device = bus_device
+                    .lock()
+                    .expect("Poisoned lock")
+                    .as_any()
+                    .downcast_ref::<MmioTransport>()
+                    .expect("Unexpected BusDevice type")
+                    .device();
+                f(*virtio_type, device_id, device_info, virtio_device)?;
+            }
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
     /// Run fn `f()` for the virtio device matching `virtio_type` and `id`.
     pub fn with_virtio_device_with_id<T, F>(&self, virtio_type: u32, id: &str, f: F) -> Result<()>
     where
@@ -389,55 +416,50 @@ impl MMIODeviceManager {
     /// Artificially kick devices as if they had external events.
     pub fn kick_devices(&self) {
         info!("Artificially kick devices.");
-        let _: Result<()> = self.for_each_device(|devtype, id, _, bus_dev| {
-            // We only kick virtio devices for now.
-            if let DeviceType::Virtio(virtio_type) = *devtype {
-                let bus_dev = bus_dev.lock().expect("Poisoned lock");
-                // Virtio devices are guaranteed MmioTransport.
-                let mmio_dev = bus_dev.as_any().downcast_ref::<MmioTransport>().unwrap();
-                let mut virtio = mmio_dev.locked_device();
-                match virtio_type {
-                    TYPE_BALLOON => {
-                        let balloon = virtio.as_mut_any().downcast_mut::<Balloon>().unwrap();
-                        // If device is activated, kick the balloon queue(s) to make up for any
-                        // pending or in-flight epoll events we may have not captured in snapshot.
-                        // Stats queue doesn't need kicking as it is notified via a `timer_fd`.
-                        if balloon.is_activated() {
-                            info!("kick balloon {}.", id);
-                            balloon.process_virtio_queues();
-                        }
+        // We only kick virtio devices for now.
+        let _: Result<()> = self.for_each_virtio_device(|virtio_type, id, _info, dev| {
+            let mut virtio = dev.lock().expect("Poisoned lock");
+            match virtio_type {
+                TYPE_BALLOON => {
+                    let balloon = virtio.as_mut_any().downcast_mut::<Balloon>().unwrap();
+                    // If device is activated, kick the balloon queue(s) to make up for any
+                    // pending or in-flight epoll events we may have not captured in snapshot.
+                    // Stats queue doesn't need kicking as it is notified via a `timer_fd`.
+                    if balloon.is_activated() {
+                        info!("kick balloon {}.", id);
+                        balloon.process_virtio_queues();
                     }
-                    TYPE_BLOCK => {
-                        let block = virtio.as_mut_any().downcast_mut::<Block>().unwrap();
-                        // If device is activated, kick the block queue(s) to make up for any
-                        // pending or in-flight epoll events we may have not captured in snapshot.
-                        // No need to kick Ratelimiters because they are restored 'unblocked' so
-                        // any inflight `timer_fd` events can be safely discarded.
-                        if block.is_activated() {
-                            info!("kick block {}.", id);
-                            block.process_virtio_queues();
-                        }
-                    }
-                    TYPE_NET => {
-                        let net = virtio.as_mut_any().downcast_mut::<Net>().unwrap();
-                        // If device is activated, kick the net queue(s) to make up for any
-                        // pending or in-flight epoll events we may have not captured in snapshot.
-                        // No need to kick Ratelimiters because they are restored 'unblocked' so
-                        // any inflight `timer_fd` events can be safely discarded.
-                        if net.is_activated() {
-                            info!("kick net {}.", id);
-                            net.process_virtio_queues();
-                        }
-                    }
-                    TYPE_VSOCK => {
-                        // Vsock has complicated protocol that isn't resilient to any packet loss,
-                        // so for Vsock we don't support connection persistence through snapshot.
-                        // Any in-flight packets or events are simply lost.
-                        // Vsock is restored 'empty'.
-                    }
-                    _ => (),
                 }
-            };
+                TYPE_BLOCK => {
+                    let block = virtio.as_mut_any().downcast_mut::<Block>().unwrap();
+                    // If device is activated, kick the block queue(s) to make up for any
+                    // pending or in-flight epoll events we may have not captured in snapshot.
+                    // No need to kick Ratelimiters because they are restored 'unblocked' so
+                    // any inflight `timer_fd` events can be safely discarded.
+                    if block.is_activated() {
+                        info!("kick block {}.", id);
+                        block.process_virtio_queues();
+                    }
+                }
+                TYPE_NET => {
+                    let net = virtio.as_mut_any().downcast_mut::<Net>().unwrap();
+                    // If device is activated, kick the net queue(s) to make up for any
+                    // pending or in-flight epoll events we may have not captured in snapshot.
+                    // No need to kick Ratelimiters because they are restored 'unblocked' so
+                    // any inflight `timer_fd` events can be safely discarded.
+                    if net.is_activated() {
+                        info!("kick net {}.", id);
+                        net.process_virtio_queues();
+                    }
+                }
+                TYPE_VSOCK => {
+                    // Vsock has complicated protocol that isn't resilient to any packet loss,
+                    // so for Vsock we don't support connection persistence through snapshot.
+                    // Any in-flight packets or events are simply lost.
+                    // Vsock is restored 'empty'.
+                }
+                _ => (),
+            }
             Ok(())
         });
     }
@@ -567,8 +589,11 @@ mod tests {
     fn test_register_virtio_device() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let guest_mem = vm_memory::test_utils::create_anon_guest_memory(
+            &[(start_addr1, 0x1000), (start_addr2, 0x1000)],
+            false,
+        )
+        .unwrap();
         let mut vm = builder::setup_kvm_vm(&guest_mem, false).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
@@ -589,8 +614,11 @@ mod tests {
     fn test_register_too_many_devices() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let guest_mem = vm_memory::test_utils::create_anon_guest_memory(
+            &[(start_addr1, 0x1000), (start_addr2, 0x1000)],
+            false,
+        )
+        .unwrap();
         let mut vm = builder::setup_kvm_vm(&guest_mem, false).unwrap();
         let mut device_manager =
             MMIODeviceManager::new(0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
@@ -657,7 +685,7 @@ mod tests {
             assert!(!msg.is_empty());
         };
         check_fmt_err(Error::BusError(devices::BusError::Overlap));
-        check_fmt_err(Error::Cmdline(kernel_cmdline::Error::CommandLineCopy));
+        check_fmt_err(Error::Cmdline(linux_loader::cmdline::Error::TooLarge));
         check_fmt_err(Error::DeviceNotFound);
         check_fmt_err(Error::EventFd(io::Error::from_raw_os_error(0)));
         check_fmt_err(Error::IncorrectDeviceType);
@@ -673,8 +701,11 @@ mod tests {
     fn test_device_info() {
         let start_addr1 = GuestAddress(0x0);
         let start_addr2 = GuestAddress(0x1000);
-        let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x1000), (start_addr2, 0x1000)]).unwrap();
+        let guest_mem = vm_memory::test_utils::create_anon_guest_memory(
+            &[(start_addr1, 0x1000), (start_addr2, 0x1000)],
+            false,
+        )
+        .unwrap();
         let mut vm = builder::setup_kvm_vm(&guest_mem, false).unwrap();
 
         #[cfg(target_arch = "x86_64")]

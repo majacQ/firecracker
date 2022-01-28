@@ -3,7 +3,7 @@
 """Tests that fail if network throughput does not obey rate limits."""
 import time
 
-import framework.utils as utils
+from framework import utils
 import host_tools.network as net_tools  # pylint: disable=import-error
 
 # The iperf version to run this tests with
@@ -30,9 +30,13 @@ MAX_BYTES_DIFF_PERCENTAGE = 10
 MAX_TIME_DIFF = 25
 
 
-def test_tx_rate_limiting(test_microvm_with_ssh, network_config):
-    """Run iperf tx with and without rate limiting; check limiting effect."""
-    test_microvm = test_microvm_with_ssh
+def test_tx_rate_limiting(test_microvm_with_api, network_config):
+    """
+    Run iperf tx with and without rate limiting; check limiting effect.
+
+    @type: functional
+    """
+    test_microvm = test_microvm_with_api
     test_microvm.spawn()
 
     test_microvm.basic_config()
@@ -90,9 +94,13 @@ def test_tx_rate_limiting(test_microvm_with_ssh, network_config):
     _check_tx_rate_limit_patch(test_microvm, guest_ips, host_ips)
 
 
-def test_rx_rate_limiting(test_microvm_with_ssh, network_config):
-    """Run iperf rx with and without rate limiting; check limiting effect."""
-    test_microvm = test_microvm_with_ssh
+def test_rx_rate_limiting(test_microvm_with_api, network_config):
+    """
+    Run iperf rx with and without rate limiting; check limiting effect.
+
+    @type: functional
+    """
+    test_microvm = test_microvm_with_api
     test_microvm.spawn()
 
     test_microvm.basic_config()
@@ -151,9 +159,13 @@ def test_rx_rate_limiting(test_microvm_with_ssh, network_config):
     _check_rx_rate_limit_patch(test_microvm, guest_ips)
 
 
-def test_rx_rate_limiting_cpu_load(test_microvm_with_ssh, network_config):
-    """Run iperf rx with rate limiting; verify cpu load is below threshold."""
-    test_microvm = test_microvm_with_ssh
+def test_rx_rate_limiting_cpu_load(test_microvm_with_api, network_config):
+    """
+    Run iperf rx with rate limiting; verify cpu load is below threshold.
+
+    @type: functional
+    """
+    test_microvm = test_microvm_with_api
     test_microvm.spawn()
 
     test_microvm.basic_config()

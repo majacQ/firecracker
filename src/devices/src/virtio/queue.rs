@@ -6,6 +6,7 @@
 // found in the THIRD-PARTY file.
 
 use logger::error;
+use logger::info;
 use std::cmp::min;
 use std::fmt;
 use std::num::Wrapping;
@@ -186,6 +187,11 @@ pub struct Queue {
 
     pub(crate) next_avail: Wrapping<u16>,
     pub(crate) next_used: Wrapping<u16>,
+
+    /// VIRTIO_F_RING_EVENT_IDX negotiated (notification suppression enabled)
+    pub(crate) uses_notif_suppression: bool,
+    /// The number of added used buffers since last guest kick
+    pub(crate) num_added: Wrapping<u16>,
 }
 
 #[allow(clippy::len_without_is_empty)]
@@ -201,6 +207,8 @@ impl Queue {
             used_ring: GuestAddress(0),
             next_avail: Wrapping(0),
             next_used: Wrapping(0),
+            uses_notif_suppression: false,
+            num_added: Wrapping(0),
         }
     }
 
@@ -215,6 +223,7 @@ impl Queue {
     }
 
     pub fn is_valid(&self, mem: &GuestMemoryMmap) -> bool {
+        info!("q is valid 1");
         let queue_size = u64::from(self.actual_size());
         let desc_table = self.desc_table;
         let desc_table_size = 16 * queue_size;
@@ -222,6 +231,7 @@ impl Queue {
         let avail_ring_size = 6 + 2 * queue_size;
         let used_ring = self.used_ring;
         let used_ring_size = 6 + 8 * queue_size;
+        info!("q is valid 2");
         if !self.ready {
             error!("attempt to use virtio queue that is not marked ready");
             false
@@ -282,6 +292,7 @@ impl Queue {
 
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
     pub fn len(&self, mem: &GuestMemoryMmap) -> u16 {
+        info!("q len read");
         (self.avail_idx(mem) - self.next_avail).0
     }
 
@@ -296,6 +307,35 @@ impl Queue {
             return None;
         }
 
+        self.do_pop_unchecked(mem)
+    }
+
+    /// Try to pop the first available descriptor chain from the avail ring.
+    /// If no descriptor is available, enable notifications.
+    pub fn pop_or_enable_notification<'a, 'b>(
+        &'a mut self,
+        mem: &'b GuestMemoryMmap,
+    ) -> Option<DescriptorChain<'b>> {
+        if !self.uses_notif_suppression {
+            return self.pop(mem);
+        }
+
+        if self.try_enable_notification(mem) {
+            return None;
+        }
+
+        self.do_pop_unchecked(mem)
+    }
+
+    /// Pop the first available descriptor chain from the avail ring.
+    ///
+    /// # Important
+    /// This is an internal method that ASSUMES THAT THERE ARE AVAILABLE DESCRIPTORS. Otherwise it
+    /// will retrieve a descriptor that contains garbage data (obsolete/empty).
+    fn do_pop_unchecked<'a, 'b>(
+        &'a mut self,
+        mem: &'b GuestMemoryMmap,
+    ) -> Option<DescriptorChain<'b>> {
         // This fence ensures all subsequent reads see the updated driver writes.
         fence(Ordering::Acquire);
 
@@ -371,6 +411,7 @@ impl Queue {
         mem.write_obj(len as u32, len_addr)
             .map_err(QueueError::UsedRing)?;
 
+        self.num_added += Wrapping(1);
         self.next_used += Wrapping(1);
 
         // This fence ensures all descriptor writes are visible before the index update is.
@@ -393,6 +434,82 @@ impl Queue {
         let addr = self.avail_ring.unchecked_add(2);
         Wrapping(mem.read_obj::<u16>(addr).unwrap())
     }
+
+    /// Get the value of the used event field of the avail ring.
+    #[inline(always)]
+    pub fn used_event(&self, mem: &GuestMemoryMmap) -> Wrapping<u16> {
+        // We need to find the `used_event` field from the avail ring.
+        let used_event_addr = self
+            .avail_ring
+            .unchecked_add(u64::from(4 + 2 * self.actual_size()));
+
+        Wrapping(mem.read_obj::<u16>(used_event_addr).unwrap())
+    }
+
+    /// Helper method that writes `val` to the `avail_event` field of the used ring.
+    fn set_avail_event(&mut self, val: u16, mem: &GuestMemoryMmap) {
+        let avail_event_addr = self
+            .used_ring
+            .unchecked_add(u64::from(4 + 8 * self.actual_size()));
+
+        mem.write_obj(val, avail_event_addr).unwrap();
+    }
+
+    /// Try to enable notification events from the guest driver. Returns true if notifications were
+    /// successfully enabled. Otherwise it means that one or more descriptors can still be consumed
+    /// from the available ring and we can't guarantee that there will be a notification. In this
+    /// case the caller might want to consume the mentioned descriptors and call this method again.
+    pub fn try_enable_notification(&mut self, mem: &GuestMemoryMmap) -> bool {
+        // If the device doesn't use notification suppression, we'll continue to get notifications
+        // no matter what.
+        if !self.uses_notif_suppression {
+            return true;
+        }
+
+        if self.len(mem) != 0 {
+            return false;
+        }
+
+        // Set the next expected avail_idx as avail_event.
+        self.set_avail_event(self.next_avail.0, mem);
+
+        // Make sure all subsequent reads are performed after `set_avail_event`.
+        fence(Ordering::SeqCst);
+
+        // If the actual avail_idx is different than next_avail one or more descriptors can still
+        // be consumed from the available ring.
+        self.next_avail.0 == self.avail_idx(mem).0
+    }
+
+    /// Enable notification suppression.
+    pub fn enable_notif_suppression(&mut self) {
+        self.uses_notif_suppression = true;
+    }
+
+    /// Check if we need to kick the guest.
+    ///
+    /// Please note this method has side effects: once it returns `true`, it considers the
+    /// driver will actually be notified, and won't return `true` again until the driver
+    /// updates `used_event` and/or the notification conditions hold once more.
+    ///
+    /// This is similar to the `vring_need_event()` method implemented by the Linux kernel.
+    pub fn prepare_kick(&mut self, mem: &GuestMemoryMmap) -> bool {
+        // If the device doesn't use notification suppression, always return true
+        if !self.uses_notif_suppression {
+            return true;
+        }
+
+        // We need to expose used array entries before checking the used_event.
+        fence(Ordering::SeqCst);
+
+        let new = self.next_used;
+        let old = self.next_used - self.num_added;
+        let used_event = self.used_event(mem);
+
+        self.num_added = Wrapping(0);
+
+        new - used_event - Wrapping(1) < new - old
+    }
 }
 
 #[cfg(test)]
@@ -402,14 +519,24 @@ pub(crate) mod tests {
 
     use crate::virtio::test_utils::VirtQueue;
     use crate::virtio::QueueError::{DescIndexOutOfBounds, UsedRing};
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    use vm_memory::{test_utils::create_anon_guest_memory, GuestAddress, GuestMemoryMmap};
+
+    impl Queue {
+        fn avail_event(&self, mem: &GuestMemoryMmap) -> u16 {
+            let avail_event_addr = self
+                .used_ring
+                .unchecked_add(u64::from(4 + 8 * self.actual_size()));
+
+            mem.read_obj::<u16>(avail_event_addr).unwrap()
+        }
+    }
 
     #[test]
     fn test_checked_new_descriptor_chain() {
-        let m = &GuestMemoryMmap::from_ranges(&[
-            (GuestAddress(0), 0x10000),
-            (GuestAddress(0x20000), 0x2000),
-        ])
+        let m = &create_anon_guest_memory(
+            &[(GuestAddress(0), 0x10000), (GuestAddress(0x20000), 0x2000)],
+            false,
+        )
         .unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
@@ -456,7 +583,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_queue_validation() {
-        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let m = &create_anon_guest_memory(&[(GuestAddress(0), 0x10000)], false).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         let mut q = vq.create_queue();
@@ -525,7 +652,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_queue_processing() {
-        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let m = &create_anon_guest_memory(&[(GuestAddress(0), 0x10000)], false).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
         let mut q = vq.create_queue();
 
@@ -589,11 +716,38 @@ pub(crate) mod tests {
             .unwrap();
         assert!(!d.has_next());
         assert!(d.next_descriptor().is_none());
+
+        // Undoing the last pop should let us walk the last chain again.
+        q.undo_pop();
+        assert_eq!(q.len(m), 1);
+
+        // Walk the last chain again (three descriptors) using pop_or_enable_notification().
+        let d = q
+            .pop_or_enable_notification(m)
+            .unwrap()
+            .next_descriptor()
+            .unwrap()
+            .next_descriptor()
+            .unwrap();
+        assert!(!d.has_next());
+        assert!(d.next_descriptor().is_none());
+
+        // There are no more descriptors, but notification suppression is disabled.
+        // Calling pop_or_enable_notification() should simply return None.
+        assert_eq!(q.avail_event(m), 0);
+        assert!(q.pop_or_enable_notification(m).is_none());
+        assert_eq!(q.avail_event(m), 0);
+
+        // There are no more descriptors and notification suppression is enabled. Calling
+        // pop_or_enable_notification() should enable notifications.
+        q.enable_notif_suppression();
+        assert!(q.pop_or_enable_notification(m).is_none());
+        assert_eq!(q.avail_event(m), 2);
     }
 
     #[test]
     fn test_add_used() {
-        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let m = &create_anon_guest_memory(&[(GuestAddress(0), 0x10000)], false).unwrap();
         let vq = VirtQueue::new(GuestAddress(0), m, 16);
 
         let mut q = vq.create_queue();
@@ -633,6 +787,115 @@ pub(crate) mod tests {
                 _ => unreachable!(),
             };
         }
+    }
+
+    #[test]
+    fn test_used_event() {
+        let m = &create_anon_guest_memory(&[(GuestAddress(0), 0x10000)], false).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+
+        let q = vq.create_queue();
+        assert_eq!(q.used_event(&m), Wrapping(0));
+
+        vq.avail.event.set(10);
+        assert_eq!(q.used_event(&m), Wrapping(10));
+
+        vq.avail.event.set(u16::MAX);
+        assert_eq!(q.used_event(&m), Wrapping(u16::MAX));
+    }
+
+    #[test]
+    fn test_set_avail_event() {
+        let m = &create_anon_guest_memory(&[(GuestAddress(0), 0x10000)], false).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+
+        let mut q = vq.create_queue();
+        assert_eq!(vq.used.event.get(), 0);
+
+        q.set_avail_event(10, &m);
+        assert_eq!(vq.used.event.get(), 10);
+
+        q.set_avail_event(u16::MAX, &m);
+        assert_eq!(vq.used.event.get(), u16::MAX);
+    }
+
+    #[test]
+    fn test_needs_kick() {
+        let m = &create_anon_guest_memory(&[(GuestAddress(0), 0x10000)], false).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+        let mut q = vq.create_queue();
+
+        {
+            // If the device doesn't have notification suppression support,
+            // `needs_notification()` should always return true.
+            q.uses_notif_suppression = false;
+            for used_idx in 0..10 {
+                for used_event in 0..10 {
+                    for num_added in 0..10 {
+                        q.next_used = Wrapping(used_idx);
+                        vq.avail.event.set(used_event);
+                        q.num_added = Wrapping(num_added);
+                        assert!(q.prepare_kick(&m));
+                    }
+                }
+            }
+        }
+
+        q.enable_notif_suppression();
+        {
+            // old used idx < used_event < next_used
+            q.next_used = Wrapping(10);
+            vq.avail.event.set(6);
+            q.num_added = Wrapping(5);
+            assert!(q.prepare_kick(&m));
+        }
+
+        {
+            // old used idx = used_event < next_used
+            q.next_used = Wrapping(10);
+            vq.avail.event.set(6);
+            q.num_added = Wrapping(4);
+            assert!(q.prepare_kick(&m));
+        }
+
+        {
+            // used_event < old used idx < next_used
+            q.next_used = Wrapping(10);
+            vq.avail.event.set(6);
+            q.num_added = Wrapping(3);
+            assert!(!q.prepare_kick(&m));
+        }
+    }
+
+    #[test]
+    fn test_try_enable_notification() {
+        let m = &create_anon_guest_memory(&[(GuestAddress(0), 0x10000)], false).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+        let mut q = vq.create_queue();
+
+        q.ready = true;
+
+        // We create a simple descriptor chain
+        vq.dtable[0].set(0x1000_u64, 0x1000, 0, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        assert_eq!(q.len(m), 1);
+
+        // Notification suppression is disabled. try_enable_notification shouldn't do anything.
+        assert_eq!(q.try_enable_notification(m), true);
+        assert_eq!(q.avail_event(m), 0);
+
+        // Enable notification suppression and check again. There is 1 available descriptor chain.
+        // Again nothing should happen.
+        q.enable_notif_suppression();
+        assert_eq!(q.try_enable_notification(m), false);
+        assert_eq!(q.avail_event(m), 0);
+
+        // Consume the descriptor. avail_event should be modified
+        assert!(q.pop(m).is_some());
+        assert_eq!(q.try_enable_notification(m), true);
+        assert_eq!(q.avail_event(m), 1);
     }
 
     #[test]

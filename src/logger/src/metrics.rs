@@ -64,7 +64,6 @@ use std::fmt;
 use std::io::Write;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-#[cfg(target_arch = "aarch64")]
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -73,7 +72,7 @@ use crate::warn;
 use lazy_static::lazy_static;
 use serde::{Serialize, Serializer};
 #[cfg(target_arch = "aarch64")]
-use vm_superio::rtc_pl031::RTCEvents;
+use vm_superio::rtc_pl031::RtcEvents;
 
 use super::extract_guard;
 
@@ -237,6 +236,8 @@ pub trait StoreMetric {
 #[derive(Default)]
 pub struct SharedIncMetric(AtomicUsize, AtomicUsize);
 
+/// Representation of a metric that is expected to hold a value that can be accessed
+/// from more than one thread, so more synchronization is necessary.
 #[derive(Default)]
 pub struct SharedStoreMetric(AtomicUsize);
 
@@ -298,6 +299,7 @@ pub struct ProcessTimeReporter {
 }
 
 impl ProcessTimeReporter {
+    /// Constructor for the process time-related reporter.
     pub fn new(
         start_time_us: Option<u64>,
         start_time_cpu_us: Option<u64>,
@@ -310,6 +312,7 @@ impl ProcessTimeReporter {
         }
     }
 
+    /// Obtain process start time in microseconds.
     pub fn report_start_time(&self) {
         if let Some(start_time) = self.start_time_us {
             let delta_us = utils::time::get_time_us(utils::time::ClockType::Monotonic) - start_time;
@@ -320,6 +323,7 @@ impl ProcessTimeReporter {
         }
     }
 
+    /// Obtain process CPU start time in microseconds.
     pub fn report_cpu_start_time(&self) {
         if let Some(cpu_start_time) = self.start_time_cpu_us {
             let delta_us = utils::time::get_time_us(utils::time::ClockType::ProcessCpu)
@@ -359,6 +363,8 @@ pub struct GetRequestsMetrics {
     pub machine_cfg_count: SharedIncMetric,
     /// Number of GETs for getting mmds.
     pub mmds_count: SharedIncMetric,
+    /// Number of GETs for getting the VMM version.
+    pub vmm_version_count: SharedIncMetric,
 }
 
 /// Metrics specific to PUT API Requests for counting user triggered actions and/or failures.
@@ -396,6 +402,10 @@ pub struct PutRequestsMetrics {
     pub mmds_count: SharedIncMetric,
     /// Number of failures in creating a new mmds.
     pub mmds_fails: SharedIncMetric,
+    /// Number of PUTs for creating a vsock device.
+    pub vsock_count: SharedIncMetric,
+    /// Number of failures in creating a vsock device.
+    pub vsock_fails: SharedIncMetric,
 }
 
 /// Metrics specific to PATCH API Requests for counting user triggered actions and/or failures.
@@ -417,6 +427,15 @@ pub struct PatchRequestsMetrics {
     pub mmds_count: SharedIncMetric,
     /// Number of failures in PATCHing an mmds.
     pub mmds_fails: SharedIncMetric,
+}
+
+/// Metrics related to deprecated user-facing API calls.
+#[derive(Default, Serialize)]
+pub struct DeprecatedApiMetrics {
+    /// Total number of calls to deprecated HTTP endpoints.
+    pub deprecated_http_api_calls: SharedIncMetric,
+    /// Total number of calls to deprecated CMD line parameters.
+    pub deprecated_cmd_line_api_calls: SharedIncMetric,
 }
 
 /// Balloon Device associated metrics.
@@ -471,6 +490,9 @@ pub struct BlockDeviceMetrics {
     pub write_count: SharedIncMetric,
     /// Number of rate limiter throttling events.
     pub rate_limiter_throttled_events: SharedIncMetric,
+    /// Number of virtio events throttled because of the IO engine.
+    /// This happens when the io_uring submission queue is full.
+    pub io_engine_throttled_events: SharedIncMetric,
 }
 
 /// Metrics specific to the i8042 device.
@@ -634,7 +656,7 @@ pub struct RTCDeviceMetrics {
 }
 
 #[cfg(target_arch = "aarch64")]
-impl RTCEvents for RTCDeviceMetrics {
+impl RtcEvents for RTCDeviceMetrics {
     fn invalid_read(&self) {
         self.missed_read_count.inc();
         self.error_count.inc();
@@ -784,6 +806,8 @@ pub struct FirecrackerMetrics {
     pub balloon: BalloonDeviceMetrics,
     /// A block device's related metrics.
     pub block: BlockDeviceMetrics,
+    /// Metrics related to deprecated API calls.
+    pub deprecated_api: DeprecatedApiMetrics,
     /// Metrics related to API GET requests.
     pub get_api_requests: GetRequestsMetrics,
     /// Metrics related to the i8042 device.
@@ -810,7 +834,7 @@ pub struct FirecrackerMetrics {
     /// Metrics related to the virtual machine manager.
     pub vmm: VmmMetrics,
     /// Metrics related to the UART device.
-    pub uart: SerialDeviceMetrics,
+    pub uart: Arc<SerialDeviceMetrics>,
     /// Metrics related to signals.
     pub signals: SignalMetrics,
     /// Metrics related to virtio-vsockets.

@@ -2,11 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests ensuring codebase style compliance for Python."""
 
-import framework.utils as utils
+from framework import utils
 
 
 def test_python_style():
-    """Fail if there's misbehaving Python style in the test system."""
+    """
+    Test that python code passes style checks.
+
+    @type: style
+    """
     # List of linter commands that should be executed for each file
     linter_cmds = [
         # Pylint
@@ -15,7 +19,8 @@ def test_python_style():
         '--argument-rgx="[a-z_][a-z0-9_]{1,35}$" ' \
         '--variable-rgx="[a-z_][a-z0-9_]{1,30}$" --disable=' \
         'bad-continuation,fixme,too-many-instance-attributes,import-error,' \
-        'too-many-locals,too-many-arguments',
+        'too-many-locals,too-many-arguments,consider-using-f-string,' \
+        'consider-using-with',
 
         # pycodestyle
         'python3 -m pycodestyle --show-pep8 --show-source --exclude=../build',

@@ -11,9 +11,11 @@ use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use vm_memory::{address::Address, GuestAddress, GuestMemoryMmap};
 
+use logger::info;
 use std::num::Wrapping;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
 #[derive(Debug)]
 pub enum Error {
@@ -43,6 +45,10 @@ pub struct QueueState {
 
     next_avail: Wrapping<u16>,
     next_used: Wrapping<u16>,
+
+    /// The number of added used buffers since last guest kick
+    #[version(start = 2)]
+    num_added: Wrapping<u16>,
 }
 
 impl Persist<'_> for Queue {
@@ -60,6 +66,7 @@ impl Persist<'_> for Queue {
             used_ring: self.used_ring.0,
             next_avail: self.next_avail,
             next_used: self.next_used,
+            num_added: self.num_added,
         }
     }
 
@@ -76,6 +83,8 @@ impl Persist<'_> for Queue {
             used_ring: GuestAddress::new(state.used_ring),
             next_avail: state.next_avail,
             next_used: state.next_used,
+            uses_notif_suppression: false,
+            num_added: state.num_added,
         })
     }
 }
@@ -124,15 +133,22 @@ impl VirtioDeviceState {
             return Err(Error::InvalidInput);
         }
 
+        info!("build queues checked 1");
+        let uses_notif_suppression = (self.acked_features & 1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         let queues: Vec<Queue> = self
             .queues
             .iter()
             .map(|queue_state| {
                 // Safe to unwrap, `Queue::restore` has no error case.
-                Queue::restore((), &queue_state).unwrap()
+                let mut queue = Queue::restore((), &queue_state).unwrap();
+                if uses_notif_suppression {
+                    queue.enable_notif_suppression();
+                }
+                queue
             })
             .collect();
 
+        info!("restore q 1");
         for q in &queues {
             // Sanity check queue size and queue max size.
             if q.max_size != expected_queue_max_size || q.size > expected_queue_max_size {
@@ -146,6 +162,7 @@ impl VirtioDeviceState {
                 return Err(Error::InvalidInput);
             }
         }
+        info!("restore q 2");
         Ok(queues)
     }
 }
@@ -202,6 +219,7 @@ mod tests {
     use crate::virtio::mmio::tests::DummyDevice;
     use crate::virtio::{net, Block, Net, Vsock, VsockUnixBackend};
 
+    use crate::virtio::block::device::FileEngineType;
     use crate::virtio::block::test_utils::default_block_with_path;
     use crate::virtio::test_utils::default_mem;
     use utils::tempfile::TempFile;
@@ -218,6 +236,7 @@ mod tests {
                 used_ring: 0,
                 next_avail: Wrapping(0),
                 next_used: Wrapping(0),
+                num_added: Wrapping(0),
             }
         }
     }
@@ -375,7 +394,10 @@ mod tests {
         // Create backing file.
         let f = TempFile::new().unwrap();
         f.as_file().set_len(0x1000).unwrap();
-        let block = default_block_with_path(f.as_path().to_str().unwrap().to_string());
+        let block = default_block_with_path(
+            f.as_path().to_str().unwrap().to_string(),
+            FileEngineType::default(),
+        );
         let block = Arc::new(Mutex::new(block));
         let mmio_transport = MmioTransport::new(mem.clone(), block.clone());
 

@@ -3,11 +3,15 @@
 """Tests ensuring desired style for commit messages."""
 
 import os
-import framework.utils as utils
+from framework import utils
 
 
 def test_gitlint():
-    """Fail if the default gitlint rules do not apply."""
+    """
+    Test that all commit messages pass the gitlint rules.
+
+    @type: style
+    """
     os.environ['LC_ALL'] = 'C.UTF-8'
     os.environ['LANG'] = 'C.UTF-8'
     try:

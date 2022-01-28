@@ -12,7 +12,7 @@
 
 ## Prerequisites
 
-If you need an opinionated way of running Firecracker, create an `i3.metal`
+If you need an opinionated way of running Firecracker, launch an `i3.metal`
 instance using Ubuntu 18.04 on EC2. Firecracker uses
 [KVM](https://www.linux-kvm.org) and needs read/write access that can be
 granted as shown below:
@@ -23,11 +23,10 @@ sudo setfacl -m u:${USER}:rw /dev/kvm
 
 The generic requirements are explained below:
 
-- **Linux 4.14+**
+- **Linux**
 
   Firecracker currently supports physical Linux **x86_64** and **aarch64**
-  hosts, running kernel version 4.14 or later. However, the **aarch64** support
-  is not feature complete (alpha stage).
+  hosts. The currently supported kernel versions can be found [here](kernel-policy.md).
 
 - **KVM**
 
@@ -85,10 +84,10 @@ file system image (to use as rootfs).
 
 1. To run an `x86_64` guest you can download such resources from:
     [kernel](https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin)
-    and [rootfs](https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs.ext4).
+    and [rootfs](https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/rootfs/bionic.rootfs.ext4).
 1. To run an `aarch64` guest, download them from:
     [kernel](https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/aarch64/kernels/vmlinux.bin)
-    and [rootfs](https://s3.amazonaws.com/spec.ccfc.min/img/aarch64/ubuntu_with_ssh/fsfiles/xenial.rootfs.ext4).
+    and [rootfs](https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/aarch64/rootfs/bionic.rootfs.ext4).
 
 Now, let's open up two shell prompts: one to run Firecracker, and another one
 to control it (by writing to the API socket). For the purpose of this guide,
@@ -117,14 +116,14 @@ In your **second shell** prompt:
   arch=`uname -m`
   dest_kernel="hello-vmlinux.bin"
   dest_rootfs="hello-rootfs.ext4"
-  image_bucket_url="https://s3.amazonaws.com/spec.ccfc.min/img"
+  image_bucket_url="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/$arch"
 
   if [ ${arch} = "x86_64" ]; then
-      kernel="${image_bucket_url}/quickstart_guide/x86_64/kernels/vmlinux.bin"
-      rootfs="${image_bucket_url}/hello/fsfiles/hello-rootfs.ext4"
+      kernel="${image_bucket_url}/kernels/vmlinux.bin"
+      rootfs="${image_bucket_url}/rootfs/bionic.rootfs.ext4"
   elif [ ${arch} = "aarch64" ]; then
-      kernel="${image_bucket_url}/quickstart_guide/aarch64/kernels/vmlinux.bin"
-      rootfs="${image_bucket_url}/aarch64/ubuntu_with_ssh/fsfiles/xenial.rootfs.ext4"
+      kernel="${image_bucket_url}/kernels/vmlinux.bin"
+      rootfs="${image_bucket_url}/rootfs/bionic.rootfs.ext4"
   else
       echo "Cannot run firecracker on $arch architecture!"
       exit 1
@@ -217,8 +216,7 @@ curl --unix-socket /tmp/firecracker.socket -i  \
   -H 'Content-Type: application/json'      \
   -d '{
       "vcpu_count": 2,
-      "mem_size_mib": 1024,
-      "ht_enabled": false
+      "mem_size_mib": 1024
   }'
 ```
 

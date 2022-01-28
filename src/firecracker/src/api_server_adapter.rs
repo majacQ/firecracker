@@ -1,6 +1,7 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use mmds::MAX_DATA_STORE_SIZE;
 use std::io::prelude::*;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -123,6 +124,7 @@ pub(crate) fn run_with_api(
     instance_info: InstanceInfo,
     process_time_reporter: ProcessTimeReporter,
     boot_timer_enabled: bool,
+    payload_limit: Option<usize>,
 ) -> ExitCode {
     // FD to notify of API events. This is a blocking eventfd by design.
     // It is used in the config/pre-boot loop which is a simple blocking loop
@@ -132,7 +134,9 @@ pub(crate) fn run_with_api(
     let (to_vmm, from_api) = channel();
     let (to_api, from_vmm) = channel();
 
-    // MMDS only supported with API.
+    MMDS.lock()
+        .expect("Failed to acquire lock on MMDS")
+        .set_data_store_limit(payload_limit.unwrap_or(MAX_DATA_STORE_SIZE));
     let mmds_info = MMDS.clone();
     let to_vmm_event_fd = api_event_fd
         .try_clone()
@@ -149,6 +153,7 @@ pub(crate) fn run_with_api(
                 api_bind_path,
                 process_time_reporter,
                 &api_seccomp_filter,
+                payload_limit,
             ) {
                 Ok(_) => (),
                 Err(api_server::Error::Io(inner)) => match inner.kind() {

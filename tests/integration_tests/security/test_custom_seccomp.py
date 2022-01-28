@@ -10,7 +10,7 @@ import time
 import psutil
 import pytest
 import requests
-import framework.utils as utils
+from framework import utils
 import host_tools.logging as log_tools
 
 from host_tools.cargo_build import run_seccompiler_bin
@@ -38,8 +38,8 @@ def _config_file_setup(test_microvm, vm_config_file):
 
     vm_config_path = os.path.join(test_microvm.path,
                                   os.path.basename(vm_config_file))
-    with open(vm_config_file) as f1:
-        with open(vm_config_path, "w") as f2:
+    with open(vm_config_file, encoding='utf-8') as f1:
+        with open(vm_config_path, "w", encoding='utf-8') as f2:
             for line in f1:
                 f2.write(line)
     test_microvm.create_jailed_resource(vm_config_path, create_jail=True)
@@ -50,7 +50,11 @@ def _config_file_setup(test_microvm, vm_config_file):
 
 
 def test_allow_all(test_microvm_with_api):
-    """Test --seccomp-filter, allowing all syscalls."""
+    """
+    Test --seccomp-filter, allowing all syscalls.
+
+    @type: security
+    """
     test_microvm = test_microvm_with_api
 
     _custom_filter_setup(test_microvm, """{
@@ -81,7 +85,11 @@ def test_allow_all(test_microvm_with_api):
 
 
 def test_working_filter(test_microvm_with_api):
-    """Test --seccomp-filter, rejecting some dangerous syscalls."""
+    """
+    Test --seccomp-filter, rejecting some dangerous syscalls.
+
+    @type: security
+    """
     test_microvm = test_microvm_with_api
 
     _custom_filter_setup(test_microvm, """{
@@ -130,12 +138,16 @@ def test_working_filter(test_microvm_with_api):
 
     test_microvm.start()
 
-    # seccomp-level should be 2, with no additional errors
+    # level should be 2, with no additional errors
     utils.assert_seccomp_level(test_microvm.jailer_clone_pid, "2")
 
 
 def test_failing_filter(test_microvm_with_api):
-    """Test --seccomp-filter, denying some needed syscalls."""
+    """
+    Test --seccomp-filter, denying some needed syscalls.
+
+    @type: security
+    """
     test_microvm = test_microvm_with_api
 
     _custom_filter_setup(test_microvm, """{
@@ -183,8 +195,8 @@ def test_failing_filter(test_microvm_with_api):
     test_microvm.expect_kill_by_signal = True
     # Check the logger output
     ioctl_num = 16 if platform.machine() == "x86_64" else 29
-    assert "Shutting down VM after intercepting a bad syscall ({})".format(
-        str(ioctl_num)) in test_microvm.log_data
+    test_microvm.check_log_message("Shutting down VM after intercepting a bad"
+                                   " syscall ({})".format(str(ioctl_num)))
 
     # Check the metrics
     lines = metrics_fifo.sequential_reader(100)
@@ -203,16 +215,20 @@ def test_failing_filter(test_microvm_with_api):
     "vm_config_file",
     ["framework/vm_config.json"]
 )
-def test_invalid_bpf(test_microvm_with_ssh, vm_config_file):
-    """Test that FC does not start, given an invalid binary filter."""
-    test_microvm = test_microvm_with_ssh
+def test_invalid_bpf(test_microvm_with_api, vm_config_file):
+    """
+    Test that FC does not start, given an invalid binary filter.
+
+    @type: security
+    """
+    test_microvm = test_microvm_with_api
 
     # Configure VM from JSON. Otherwise, the test will error because
     # the process will be killed before configuring the API socket.
-    _config_file_setup(test_microvm_with_ssh, vm_config_file)
+    _config_file_setup(test_microvm_with_api, vm_config_file)
 
     bpf_path = os.path.join(test_microvm.path, 'bpf.out')
-    file = open(bpf_path, "w")
+    file = open(bpf_path, "w", encoding='utf-8')
     file.write("Invalid BPF!")
     file.close()
 

@@ -10,7 +10,11 @@ import host_tools.logging as log_tools
 
 
 def test_flush_metrics(test_microvm_with_api):
-    """Check the `FlushMetrics` vmm action."""
+    """
+    Check the `FlushMetrics` vmm action.
+
+    @type: functional
+    """
     microvm = test_microvm_with_api
     microvm.spawn()
     microvm.basic_config()
@@ -33,6 +37,7 @@ def test_flush_metrics(test_microvm_with_api):
         'api_server',
         'balloon',
         'block',
+        'deprecated_api',
         'get_api_requests',
         'i8042',
         'latencies_us',

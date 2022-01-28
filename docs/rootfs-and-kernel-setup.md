@@ -2,12 +2,10 @@
 
 ## Creating a kernel Image
 
-Currently, Firecracker supports only uncompressed, ELF kernel images. You can
-build an uncompressed Linux kernel image with:
+### Manual compilation
 
-```bash
-make vmlinux
-```
+Currently, Firecracker supports uncompressed ELF kernel images on x86_64 while on
+aarch64 it supports PE formatted images.
 
 Here's a quick step-by-step guide to building your own kernel that Firecracker
 can boot:
@@ -26,10 +24,10 @@ can boot:
    git checkout v4.20
    ```
 
-1. You will need to configure your Linux build. You can start from
-   [our recommended config](../resources/microvm-kernel-x86_64.config) by
-   copying it to `.config` (under the Linux sources dir). You can make
-   interactive config adjustments using:
+1. You will need to configure your Linux build. You can start from our
+   recommended  [guest kernel configurations](../resources/guest_configs/)
+   by copying the relevant one to `.config` (under the Linux sources dir).
+   You can make interactive config adjustments using:
 
    ```bash
    make menuconfig
@@ -38,14 +36,41 @@ can boot:
    *Note*: there are many ways of building a kernel config file, other than
    `menuconfig`. You are free to use whichever one you choose.
 
-1. Build the uncompressed kernel image:
+1. Build the kernel image:
 
    ```bash
-   make vmlinux
+   arch=$(uname -m)
+   if [ "$arch" = "x86_64" ]; then
+        make vmlinux
+   elif [ "$arch" = "aarch64" ]; then
+        make Image
+   fi
    ```
 
-1. Upon a successful build, you can find the uncompressed kernel image under
-   `./vmlinux`.
+1. Upon a successful build, you can find the kernel image under `./vmlinux`
+   (for x86) or `./arch/arm64/boot/Image` (for aarch64).
+
+For a list of currently supported kernel versions, check out the
+[kernel support policy](kernel-policy.md).
+
+### Use the provided recipe
+
+The kernel images used in our CI to test Firecracker's features are obtained by
+using the recipe inside devtool:
+
+```bash
+config="resources/guest_configs/microvm-kernel-x86_64-4.14.config"
+./tools/devtool build_kernel -c $config -n 8
+```
+
+or
+
+```bash
+config="resources/guest_configs/microvm-kernel-arm64-4.14.config"
+./tools/devtool build_kernel -c $config -n 8
+```
+
+on an aarch64 machine.
 
 ## Creating a rootfs Image
 
@@ -55,7 +80,10 @@ OpenRC as an init system. Note that, whichever file system you choose to use,
 support for it will have to be compiled into the kernel, so it can be mounted
 at boot time.
 
-To build an EXT4 image:
+In order to obtain an EXT4 image that you can use with Firecracker, you have
+the following options:
+
+### Manual build
 
 1. Prepare a properly-sized file. We'll use 50MiB here, but this depends
    on how much data you'll want to fit inside:
@@ -136,6 +164,24 @@ Alpine Linux:
    ```bash
    sudo umount /tmp/my-rootfs
    ```
+
+### Use the provided recipe
+
+The disk images used in our CI to test Firecracker's features are obtained by
+using the recipe inside devtool:
+
+```bash
+./tools/devtool build_rootfs -s 300MB
+```
+
+or
+
+```bash
+./tools/devtool build_rootfs -p
+```
+
+in order to obtain a partuuid enabled rootfs.
+The images resulting using this method are minimized Ubuntu 18.04.
 
 You should now have a kernel image (`vmlinux`) and a rootfs image
 (`rootfs.ext4`), that you can boot with Firecracker.

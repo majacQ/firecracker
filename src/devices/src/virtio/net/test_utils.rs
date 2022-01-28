@@ -1,6 +1,8 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![doc(hidden)]
+
 use std::fs::File;
 use std::os::raw::c_ulong;
 use std::os::unix::ffi::OsStrExt;
@@ -9,6 +11,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{mem, result};
 
+#[cfg(test)]
 use crate::virtio::net::device::vnet_hdr_len;
 use crate::virtio::net::tap::{Error, IfReqBuilder, Tap};
 use crate::virtio::test_utils::VirtQueue;
@@ -267,7 +270,8 @@ pub fn default_guest_mac() -> MacAddr {
 }
 
 pub fn default_guest_memory() -> GuestMemoryMmap {
-    GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap()
+    vm_memory::test_utils::create_anon_guest_memory(&[(GuestAddress(0), 0x10000)], false)
+        .expect("Cannot initialize memory")
 }
 
 pub fn set_mac(net: &mut Net, mac: MacAddr) {
@@ -319,7 +323,11 @@ pub mod test {
         pub fn default() -> TestHelper<'a> {
             let mut event_manager = EventManager::new().unwrap();
             let mut net = default_net();
-            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MAX_BUFFER_SIZE)]).unwrap();
+            let mem = vm_memory::test_utils::create_guest_memory_unguarded(
+                &[(GuestAddress(0), MAX_BUFFER_SIZE)],
+                false,
+            )
+            .unwrap();
             // transmute mem_ref lifetime to 'a
             let mem_ref = unsafe { mem::transmute::<&GuestMemoryMmap, &'a GuestMemoryMmap>(&mem) };
 

@@ -65,7 +65,7 @@ use seccompiler::BpfProgram;
 use snapshot::Persist;
 use utils::epoll::EventSet;
 use utils::eventfd::EventFd;
-use vm_memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap};
+use vm_memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
 /// Shorthand type for the EventManager flavour used by Firecracker.
 pub type EventManager = BaseEventManager<Arc<Mutex<dyn MutEventSubscriber>>>;
@@ -230,7 +230,7 @@ pub type DirtyBitmap = HashMap<usize, Vec<u64>>;
 
 /// Returns the size of guest memory, in MiB.
 pub(crate) fn mem_size_mib(guest_memory: &GuestMemoryMmap) -> u64 {
-    guest_memory.map_and_fold(0, |(_, region)| region.len(), |a, b| a + b) >> 20
+    guest_memory.iter().map(|region| region.len()).sum::<u64>() >> 20
 }
 
 /// Contains the state and associated methods required for the Firecracker VMM.
@@ -253,6 +253,11 @@ pub struct Vmm {
 }
 
 impl Vmm {
+    /// Gets Vmm version.
+    pub fn version(&self) -> String {
+        self.instance_info.vmm_version.clone()
+    }
+
     /// Gets Vmm instance info.
     pub fn instance_info(&self) -> InstanceInfo {
         self.instance_info.clone()
@@ -443,37 +448,54 @@ impl Vmm {
     ) -> std::result::Result<(), MicrovmStateError> {
         use self::MicrovmStateError::*;
 
+        info!("vcpu restore 1");
         if vcpu_states.len() != self.vcpus_handles.len() {
             return Err(InvalidInput);
         }
+        info!("vcpu restore 2");
         for (handle, state) in self.vcpus_handles.iter().zip(vcpu_states.drain(..)) {
+            info!("vcpu send event");
             handle
                 .send_event(VcpuEvent::RestoreState(Box::new(state)))
                 .map_err(MicrovmStateError::SignalVcpu)?;
         }
 
+        info!("vcpu restore 3");
         let vcpu_responses = self
             .vcpus_handles
             .iter()
             // `Iterator::collect` can transform a `Vec<Result>` into a `Result<Vec>`.
             .map(|handle| {
+                info!("vcpu get response");
                 handle
                     .response_receiver()
                     .recv_timeout(Duration::from_millis(1000))
             })
             .collect::<std::result::Result<Vec<VcpuResponse>, RecvTimeoutError>>()
-            .map_err(|_| MicrovmStateError::UnexpectedVcpuResponse)?;
+            .map_err(|_| {
+                info!("response timeout");
+                MicrovmStateError::UnexpectedVcpuResponse
+            })?;
 
+        info!("vcpu restore 4");
         for response in vcpu_responses.into_iter() {
             match response {
                 VcpuResponse::RestoredState => (),
-                VcpuResponse::Error(e) => return Err(MicrovmStateError::RestoreVcpuState(e)),
-                VcpuResponse::NotAllowed(reason) => {
-                    return Err(MicrovmStateError::NotAllowed(reason))
+                VcpuResponse::Error(e) => {
+                    info!("vcpu restore error {:?}", e);
+                    return Err(MicrovmStateError::RestoreVcpuState(e));
                 }
-                _ => return Err(MicrovmStateError::UnexpectedVcpuResponse),
+                VcpuResponse::NotAllowed(reason) => {
+                    info!("vcpu restore not allowed {:?}", reason);
+                    return Err(MicrovmStateError::NotAllowed(reason));
+                }
+                _ => {
+                    info!("vcpu unexpected response");
+                    return Err(MicrovmStateError::UnexpectedVcpuResponse);
+                }
             }
         }
+        info!("vcpu restore 5");
 
         Ok(())
     }
@@ -481,17 +503,18 @@ impl Vmm {
     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
     pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap> {
         let mut bitmap: DirtyBitmap = HashMap::new();
-        self.guest_memory.with_regions_mut(
-            |slot: usize, region: &GuestRegionMmap| -> Result<()> {
+        self.guest_memory
+            .iter()
+            .enumerate()
+            .try_for_each(|(slot, region)| {
                 let bitmap_region = self
                     .vm
                     .fd()
-                    .get_dirty_log(slot as u32, region.len() as usize)
-                    .map_err(Error::DirtyBitmap)?;
+                    .get_dirty_log(slot as u32, region.len() as usize)?;
                 bitmap.insert(slot, bitmap_region);
                 Ok(())
-            },
-        )?;
+            })
+            .map_err(Error::DirtyBitmap)?;
         Ok(bitmap)
     }
 
@@ -514,7 +537,7 @@ impl Vmm {
             .with_virtio_device_with_id(TYPE_BLOCK, drive_id, |block: &mut Block| {
                 block
                     .update_disk_image(path_on_host)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| format!("{:?}", e))
             })
             .map_err(Error::DeviceManager)
     }
