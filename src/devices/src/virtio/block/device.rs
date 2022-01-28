@@ -30,7 +30,12 @@ use super::{
     Error, CONFIG_SPACE_SIZE, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
 };
 use crate::virtio::{IrqTrigger, IrqType};
+  <<<<<<< feature/uffd-on-snaps-response
+
+use logger::info;
+  =======
 use block_io::FileEngine;
+  >>>>>>> main
 use serde::{Deserialize, Serialize};
 use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
@@ -242,6 +247,11 @@ impl Block {
         is_disk_read_only: bool,
         is_disk_root: bool,
         rate_limiter: RateLimiter,
+  <<<<<<< feature/uffd-on-snaps-response
+    ) -> io::Result<Block> {
+        info!("block inner 1");
+        let disk_properties = DiskProperties::new(disk_image_path, is_disk_read_only, cache_type)?;
+  =======
         file_engine_type: FileEngineType,
     ) -> result::Result<Block, Error> {
         let disk_properties = DiskProperties::new(
@@ -250,6 +260,7 @@ impl Block {
             cache_type,
             file_engine_type,
         )?;
+  >>>>>>> main
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
@@ -257,6 +268,7 @@ impl Block {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
         }
 
+        info!("block inner 2");
         if is_disk_read_only {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
         };
@@ -265,6 +277,7 @@ impl Block {
 
         let queues = QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
 
+        info!("block inner 3");
         Ok(Block {
             id,
             root_device: is_disk_root,
