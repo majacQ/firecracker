@@ -284,12 +284,22 @@ fn main_exitable() -> ExitCode {
         };
     }
 
+  <<<<<<< feature/uffd-on-snaps-response
+    // let mut seccomp_filters: BpfThreadMap = match SeccompConfig::from_args(
+    //     arguments.single_value("seccomp-level"),
+    //     arguments.flag_present("no-seccomp"),
+    //     arguments.single_value("seccomp-filter"),
+    // )
+    // .and_then(get_filters)
+    let mut seccomp_filters = match get_filters(SeccompConfig::None) {
+  =======
     let mut seccomp_filters: BpfThreadMap = match SeccompConfig::from_args(
         arguments.flag_present("no-seccomp"),
         arguments.single_value("seccomp-filter"),
     )
     .and_then(get_filters)
     {
+  >>>>>>> main
         Ok(filters) => filters,
         Err(e) => {
             return generic_error_exit(&format!("Seccomp error: {}", e));
@@ -311,8 +321,7 @@ fn main_exitable() -> ExitCode {
             .expect("Failed to acquire lock on MMDS")
             .put_data(
                 serde_json::from_str(&data).expect("MMDS error: metadata provided not valid json"),
-            )
-            .expect("MMDS content load from file failed.");
+            );
 
         info!("Successfully added metadata to mmds from file");
     }

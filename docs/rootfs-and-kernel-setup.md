@@ -50,6 +50,9 @@ can boot:
 1. Upon a successful build, you can find the kernel image under `./vmlinux`
    (for x86) or `./arch/arm64/boot/Image` (for aarch64).
 
+For a list of currently supported kernel versions, check out the
+[kernel support policy](kernel-policy.md).
+
 ### Use the provided recipe
 
 The kernel images used in our CI to test Firecracker's features are obtained by
@@ -168,7 +171,7 @@ The disk images used in our CI to test Firecracker's features are obtained by
 using the recipe inside devtool:
 
 ```bash
-./tools/devtool build_rootfs -s 300
+./tools/devtool build_rootfs -s 300MB
 ```
 
 or

@@ -563,13 +563,18 @@ class MachineConfigure():
 
     MACHINE_CFG_RESOURCE = 'machine-config'
 
-    def __init__(self, api_usocket_full_name, api_session):
+    def __init__(
+            self,
+            api_usocket_full_name,
+            api_session,
+            firecracker_version):
         """Specify the information needed for sending API requests."""
         url_encoded_path = urllib.parse.quote_plus(api_usocket_full_name)
         api_url = API_USOCKET_URL_PREFIX + url_encoded_path + '/'
 
         self._machine_cfg_url = api_url + self.MACHINE_CFG_RESOURCE
         self._api_session = api_session
+        self._firecracker_version = firecracker_version
         self._datax = {}
 
     @property
@@ -602,11 +607,11 @@ class MachineConfigure():
             self._machine_cfg_url
         )
 
-    @staticmethod
     def create_json(
+            self,
             vcpu_count=None,
             mem_size_mib=None,
-            ht_enabled=None,
+            smt=None,
             cpu_template=None,
             track_dirty_pages=None):
         """Compose the json associated to this type of API request."""
@@ -617,8 +622,10 @@ class MachineConfigure():
         if mem_size_mib is not None:
             datax['mem_size_mib'] = mem_size_mib
 
-        if ht_enabled is not None:
-            datax['ht_enabled'] = ht_enabled
+        if compare_versions(self._firecracker_version, "0.25.0") <= 0:
+            datax['ht_enabled'] = False if smt is None else smt
+        elif smt is not None:
+            datax['smt'] = smt
 
         if cpu_template is not None:
             datax['cpu_template'] = cpu_template
@@ -664,7 +671,7 @@ class MMDS():
         )
 
     def get(self):
-        """Get the status of the mmds request."""
+        """Get the status of the MMDS request."""
         return self._api_session.get(
             self._mmds_cfg_url
         )
@@ -706,7 +713,6 @@ class Network():
             iface_id=None,
             host_dev_name=None,
             guest_mac=None,
-            allow_mmds_requests=None,
             rx_rate_limiter=None,
             tx_rate_limiter=None):
         """Create the json for the net specific API request."""
@@ -719,9 +725,6 @@ class Network():
 
         if guest_mac is not None:
             datax['guest_mac'] = guest_mac
-
-        if allow_mmds_requests is not None:
-            datax['allow_mmds_requests'] = allow_mmds_requests
 
         if tx_rate_limiter is not None:
             datax['tx_rate_limiter'] = tx_rate_limiter

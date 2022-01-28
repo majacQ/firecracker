@@ -73,9 +73,15 @@ def test_drive_io_engine(test_microvm_with_api, network_config):
         assert test_microvm.api_session.is_status_bad_request(
             response.status_code)
 
+  <<<<<<< feature/io_uring
         assert "Received Error. Status code: 400 Bad Request. Message: Unable"\
             " to create the block device FileEngine(UnsupportedEngine(Async))"\
             in test_microvm.log_data
+  =======
+        test_microvm.check_log_message(
+            "Received Error. Status code: 400 Bad Request. Message: Unable"
+            " to create the block device FileEngine(UnsupportedEngine(Async))")
+  >>>>>>> main
 
         # Now configure the default engine type and check that it works.
         response = test_microvm.drive.put_with_default_io_engine(
@@ -181,7 +187,7 @@ def test_api_put_update_pre_boot(test_microvm_with_api):
     # The machine configuration has a default value, so all PUTs are updates.
     microvm_config_json = {
         'vcpu_count': 4,
-        'ht_enabled': True,
+        'smt': platform.machine() == 'x86_64',
         'mem_size_mib': 256,
         'track_dirty_pages': True
     }
@@ -191,14 +197,14 @@ def test_api_put_update_pre_boot(test_microvm_with_api):
     if platform.machine() == 'aarch64':
         response = test_microvm.machine_cfg.put(
             vcpu_count=microvm_config_json['vcpu_count'],
-            ht_enabled=microvm_config_json['ht_enabled'],
+            smt=microvm_config_json['smt'],
             mem_size_mib=microvm_config_json['mem_size_mib'],
             track_dirty_pages=microvm_config_json['track_dirty_pages']
         )
     else:
         response = test_microvm.machine_cfg.put(
             vcpu_count=microvm_config_json['vcpu_count'],
-            ht_enabled=microvm_config_json['ht_enabled'],
+            smt=microvm_config_json['smt'],
             mem_size_mib=microvm_config_json['mem_size_mib'],
             cpu_template=microvm_config_json['cpu_template'],
             track_dirty_pages=microvm_config_json['track_dirty_pages']
@@ -213,8 +219,8 @@ def test_api_put_update_pre_boot(test_microvm_with_api):
     vcpu_count = microvm_config_json['vcpu_count']
     assert response_json['vcpu_count'] == vcpu_count
 
-    ht_enabled = microvm_config_json['ht_enabled']
-    assert response_json['ht_enabled'] == ht_enabled
+    smt = microvm_config_json['smt']
+    assert response_json['smt'] == smt
 
     mem_size_mib = microvm_config_json['mem_size_mib']
     assert response_json['mem_size_mib'] == mem_size_mib
@@ -298,6 +304,102 @@ def test_net_api_put_update_pre_boot(test_microvm_with_api):
     assert test_microvm.api_session.is_status_no_content(response.status_code)
 
 
+def test_api_mmds_config(test_microvm_with_api):
+    """
+    Test /mmds/config PUT scenarios that unit tests can't cover.
+
+    Tests updates on MMDS config before and after attaching a network device.
+
+    @type: negative
+    """
+    test_microvm = test_microvm_with_api
+    test_microvm.spawn()
+
+    # Set up the microVM with 2 vCPUs, 256 MiB of RAM  and
+    # a root file system with the rw permission.
+    test_microvm.basic_config()
+
+    # Setting MMDS config with empty network interface IDs list is not allowed.
+    response = test_microvm.mmds.put_config(json={
+        'network_interfaces': []
+    })
+    err_msg = "The list of network interface IDs that allow " \
+              "forwarding MMDS requests is empty."
+    assert test_microvm.api_session.is_status_bad_request(response.status_code)
+    assert err_msg in response.text
+
+    # Setting MMDS config when no network device has been attached
+    # is not allowed.
+    response = test_microvm.mmds.put_config(json={
+        'network_interfaces': ['foo']
+    })
+    err_msg = "The list of network interface IDs provided contains " \
+              "at least one ID that does not correspond to any " \
+              "existing network interface."
+    assert test_microvm.api_session.is_status_bad_request(response.status_code)
+    assert err_msg in response.text
+
+    # Attach network interface.
+    tap = net_tools.Tap('tap1', test_microvm.jailer.netns)
+    response = test_microvm.network.put(
+        iface_id='1',
+        guest_mac='06:00:00:00:00:01',
+        host_dev_name=tap.name
+    )
+    assert test_microvm.api_session.is_status_no_content(response.status_code)
+
+    # Setting MMDS config with an ID that does not correspond to an already
+    # attached network device is not allowed.
+    response = test_microvm.mmds.put_config(json={
+        'network_interfaces': ['1', 'foo']
+    })
+    err_msg = "The list of network interface IDs provided contains" \
+              " at least one ID that does not correspond to any " \
+              "existing network interface."
+    assert test_microvm.api_session.is_status_bad_request(response.status_code)
+    assert err_msg in response.text
+
+    # Updates to MMDS version with invalid value are not allowed.
+    response = test_microvm.mmds.put_config(json={
+        'version': 'foo',
+        'network_interfaces': ['1']
+    })
+    err_msg = "An error occurred when deserializing the json body of a " \
+              "request: unknown variant `foo`, expected `V1` or `V2`"
+    assert test_microvm.api_session.is_status_bad_request(response.status_code)
+    assert err_msg in response.text
+
+    # Valid MMDS config not specifying version or IPv4 address.
+    response = test_microvm.mmds.put_config(json={
+        'network_interfaces': ['1']
+    })
+    assert test_microvm.api_session.is_status_no_content(response.status_code)
+    assert test_microvm.full_cfg.get().json(
+    )['mmds-config']['version'] == "V1"
+
+    # Valid MMDS config not specifying version.
+    mmds_config = {
+        'ipv4_address': '169.254.169.250',
+        'network_interfaces': ['1']
+    }
+    response = test_microvm.mmds.put_config(json=mmds_config)
+    assert test_microvm.api_session.is_status_no_content(response.status_code)
+    assert test_microvm.full_cfg.get().json(
+    )['mmds-config']['ipv4_address'] == "169.254.169.250"
+
+    # Valid MMDS config.
+    mmds_config = {
+        'version': 'V2',
+        'ipv4_address': '169.254.169.250',
+        'network_interfaces': ['1']
+    }
+    response = test_microvm.mmds.put_config(json=mmds_config)
+    assert test_microvm.api_session.is_status_no_content(response.status_code)
+    assert test_microvm.full_cfg.get().json(
+    )['mmds-config']['version'] == "V2"
+
+
+# pylint: disable=too-many-statements
 def test_api_machine_config(test_microvm_with_api):
     """
     Test /machine_config PUT/PATCH scenarios that unit tests can't cover.
@@ -313,9 +415,9 @@ def test_api_machine_config(test_microvm_with_api):
     )
     assert test_microvm.api_session.is_status_bad_request(response.status_code)
 
-    # Test invalid type for ht_enabled flag.
+    # Test invalid type for smt flag.
     response = test_microvm.machine_cfg.put(
-        ht_enabled='random_string'
+        smt='random_string'
     )
     assert test_microvm.api_session.is_status_bad_request(response.status_code)
 
@@ -330,6 +432,50 @@ def test_api_machine_config(test_microvm_with_api):
     )
     assert test_microvm.api_session.is_status_bad_request(response.status_code)
 
+    # Test missing vcpu_count.
+    response = test_microvm.machine_cfg.put(
+        mem_size_mib=128
+    )
+    assert test_microvm.api_session.is_status_bad_request(response.status_code)
+    assert "Missing mandatory field: `vcpu_count`." in response.text
+
+    # Test missing mem_size_mib.
+    response = test_microvm.machine_cfg.put(
+        vcpu_count=2
+    )
+    assert test_microvm.api_session.is_status_bad_request(response.status_code)
+    assert "Missing mandatory field: `mem_size_mib`." in response.text
+
+    # Test default smt value.
+    response = test_microvm.machine_cfg.put(
+        mem_size_mib=128,
+        vcpu_count=1
+    )
+    assert test_microvm.api_session.is_status_no_content(
+        response.status_code
+    )
+
+    response = test_microvm.machine_cfg.get()
+    assert test_microvm.api_session.is_status_ok(response.status_code)
+    assert response.json()["smt"] is False
+
+    # Test that smt=True errors on ARM.
+    response = test_microvm.machine_cfg.patch(
+        smt=True
+    )
+    if platform.machine() == "x86_64":
+        assert test_microvm.api_session.is_status_no_content(
+            response.status_code
+        )
+    else:
+        assert test_microvm.api_session.is_status_bad_request(
+            response.status_code
+        )
+        assert \
+            "Enabling simultaneous multithreading is not supported on aarch64"\
+            in response.text
+
+    # Test that CPU template errors on ARM.
     response = test_microvm.machine_cfg.patch(
         cpu_template='C3'
     )
@@ -408,8 +554,11 @@ def test_api_machine_config(test_microvm_with_api):
     # Validate full vm configuration after patching machine config.
     response = test_microvm.full_cfg.get()
     assert test_microvm.api_session.is_status_ok(response.status_code)
-    assert response.json()['machine-config']['vcpu_count'] == 2
-    assert response.json()['machine-config']['mem_size_mib'] == 256
+    json = response.json()
+    assert json['machine-config']['vcpu_count'] == 2
+    assert json['machine-config']['mem_size_mib'] == 256
+    assert json['machine-config']['smt'] == (
+        platform.machine() == "x86_64")
 
 
 def test_api_put_update_post_boot(test_microvm_with_api):
@@ -458,7 +607,6 @@ def test_api_put_update_post_boot(test_microvm_with_api):
 
     response = test_microvm.machine_cfg.put(
         vcpu_count=4,
-        ht_enabled=False,
         mem_size_mib=128
     )
     assert test_microvm.api_session.is_status_bad_request(response.status_code)
@@ -480,6 +628,16 @@ def test_api_put_update_post_boot(test_microvm_with_api):
         is_read_only=False,
         is_root_device=True
     )
+    assert test_microvm.api_session.is_status_bad_request(response.status_code)
+    assert expected_err in response.text
+
+    # MMDS config is not allowed post-boot.
+    mmds_config = {
+        'version': 'V2',
+        'ipv4_address': '169.254.169.250',
+        'network_interfaces': ['1']
+    }
+    response = test_microvm.mmds.put_config(json=mmds_config)
     assert test_microvm.api_session.is_status_bad_request(response.status_code)
     assert expected_err in response.text
 
@@ -1206,7 +1364,7 @@ def test_get_full_config(test_microvm_with_api):
     expected_cfg['machine-config'] = {
         'vcpu_count': 2,
         'mem_size_mib': 256,
-        'ht_enabled': False,
+        'smt': False,
         'track_dirty_pages': False
     }
     expected_cfg['boot-source'] = {
@@ -1269,13 +1427,25 @@ def test_get_full_config(test_microvm_with_api):
         'host_dev_name': tap1.name,
         'guest_mac': '06:00:00:00:00:01',
         'rx_rate_limiter': None,
-        'tx_rate_limiter': tx_rl,
-        'allow_mmds_requests': False
+        'tx_rate_limiter': tx_rl
     }]
+
+    # Update MMDS config.
+    mmds_config = {
+        'version': 'V2',
+        'ipv4_address': '169.254.169.250',
+        'network_interfaces': ['1']
+    }
+    response = test_microvm.mmds.put_config(json=mmds_config)
+    assert test_microvm.api_session.is_status_no_content(response.status_code)
 
     expected_cfg['logger'] = None
     expected_cfg['metrics'] = None
-    expected_cfg['mmds-config'] = None
+    expected_cfg['mmds-config'] = {
+        'version': 'V2',
+        'ipv4_address': '169.254.169.250',
+        'network_interfaces': ['1']
+    }
 
     # Getting full vm configuration should be available pre-boot.
     response = test_microvm.full_cfg.get()

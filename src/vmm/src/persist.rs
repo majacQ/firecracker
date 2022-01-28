@@ -6,7 +6,7 @@
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::builder::{self, StartMicrovmError};
@@ -31,11 +31,13 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use arch::regs::{get_manufacturer_id_from_host, get_manufacturer_id_from_state};
 use logger::{error, info};
 use seccompiler::BpfThreadMap;
+use serde::Serialize;
 use snapshot::Snapshot;
+use userfaultfd::{Uffd, UffdBuilder};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{GuestMemory, GuestMemoryMmap};
 
 #[cfg(target_arch = "x86_64")]
 const FC_V0_23_MAX_DEVICES: u32 = 11;
@@ -62,6 +64,39 @@ pub struct MicrovmState {
     pub vcpu_states: Vec<VcpuState>,
     /// Device states.
     pub device_states: DeviceStates,
+}
+
+/// This describes the mapping between Firecracker base virtual address and offset in the
+/// buffer or file backend for a guest memory region. It is used to tell an external
+/// process/thread where to populate the guest memory data for this range.
+///
+/// E.g. Guest memory contents for a region of `size` bytes can be found in the backend
+/// at `offset` bytes from the beginning, and should be copied/populated into `base_host_address`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RegionBackendMapping {
+    /// Base host virtual address where the guest memory contents for this region
+    /// should be copied/populated.
+    pub base_h_va: u64,
+    /// Region size.
+    pub size: usize,
+    /// Offset in the backend file/buffer where the region contents are.
+    pub offset: u64,
+}
+
+/// Describes memory regions backed by inner uffd.
+#[derive(Debug, Serialize)]
+pub struct UffdBackendDescription {
+    /// Region mappings: host addr <-> backend offset.
+    pub regions: Vec<RegionBackendMapping>,
+    /// Uffd used to handle pagefaults and populate regions with content from backend.
+    #[serde(skip_serializing)]
+    pub uffd: Uffd,
+}
+
+impl PartialEq for UffdBackendDescription {
+    fn eq(&self, other: &Self) -> bool {
+        self.regions.eq(&other.regions)
+    }
 }
 
 /// Errors related to saving and restoring Microvm state.
@@ -432,6 +467,91 @@ pub fn snapshot_state_sanity_check(
     Ok(())
 }
 
+fn uffd_handler(uffd_desc: UffdBackendDescription, mem_file_path: PathBuf) {
+    use libc::c_void;
+    use nix::poll::{poll, PollFd, PollFlags};
+    use nix::sys::mman::{mmap, MapFlags, ProtFlags};
+    use nix::unistd::{sysconf, SysconfVar};
+    use std::os::unix::io::AsRawFd;
+    use std::ptr;
+
+    let page_size = sysconf(SysconfVar::PAGE_SIZE).unwrap().unwrap() as usize;
+    let uffd = &uffd_desc.uffd;
+
+    let memsize = uffd_desc.regions.iter().map(|r| r.size).sum();
+    let file = File::open(mem_file_path).expect("cannot open memfile");
+    assert_eq!(memsize as u64, file.metadata().unwrap().len());
+
+    // Create a page that will be copied into the faulting region
+    let memfile_buffer = unsafe {
+        mmap(
+            ptr::null_mut(),
+            memsize,
+            ProtFlags::PROT_READ,
+            MapFlags::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+        .expect("mmap")
+    };
+
+    // Loop, handling incoming events on the userfaultfd file descriptor
+    loop {
+        // See what poll() tells us about the userfaultfd
+        let pollfd = PollFd::new(uffd.as_raw_fd(), PollFlags::POLLIN);
+        let nready = poll(&mut [pollfd], -1).expect("poll");
+
+        info!("\nfault_handler_thread():");
+        let revents = pollfd.revents().unwrap();
+        info!(
+            "    poll() returns: nready = {}; POLLIN = {}; POLLERR = {}",
+            nready,
+            revents.contains(PollFlags::POLLIN),
+            revents.contains(PollFlags::POLLERR),
+        );
+
+        // Read an event from the userfaultfd
+        let event = uffd
+            .read_event()
+            .expect("read uffd_msg")
+            .expect("uffd_msg ready");
+
+        // We expect only one kind of event; verify that assumption
+        if let userfaultfd::Event::Pagefault { addr, .. } = event {
+            // Display info about the page-fault event
+            info!("    UFFD_EVENT_PAGEFAULT event: {:?}", event);
+            let dst = (addr as usize & !(page_size as usize - 1)) as *mut c_void;
+            info!(
+                "    looking for file offset corresponding to hVA dst: {:?}",
+                dst
+            );
+            let mut found_mapping = None;
+            for r in uffd_desc.regions.iter() {
+                let fault_page_addr = dst as u64;
+                if r.base_h_va <= fault_page_addr && fault_page_addr < r.base_h_va + r.size as u64 {
+                    found_mapping = Some(r.clone());
+                }
+            }
+            if let Some(r) = &found_mapping {
+                info!("    found it in: {:?}", r);
+            } else {
+                panic!("could not find addr within region mappings");
+            }
+
+            let r = found_mapping.unwrap();
+            let src = memfile_buffer as u64 + r.offset;
+            // Populate whole region from backing mem-file.
+            let copy = unsafe {
+                uffd.copy(src as *const _, r.base_h_va as *mut _, r.size, true)
+                    .expect("uffd copy")
+            };
+            info!("        (uffdio_copy.copy returned {})", copy);
+        } else {
+            panic!("Unexpected event on userfaultfd");
+        }
+    }
+}
+
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
 pub fn restore_from_snapshot(
     instance_info: &InstanceInfo,
@@ -439,20 +559,68 @@ pub fn restore_from_snapshot(
     seccomp_filters: &BpfThreadMap,
     params: &LoadSnapshotParams,
     version_map: VersionMap,
-) -> std::result::Result<Arc<Mutex<Vmm>>, LoadSnapshotError> {
+) -> std::result::Result<(Arc<Mutex<Vmm>>, Option<UffdBackendDescription>), LoadSnapshotError> {
     use self::LoadSnapshotError::*;
     let track_dirty_pages = params.enable_diff_snapshots;
     let microvm_state = snapshot_state_from_file(&params.snapshot_path, version_map)?;
 
     // Some sanity checks before building the microvm.
     snapshot_state_sanity_check(&microvm_state)?;
+    let mem_state = &microvm_state.memory_state;
 
-    let guest_memory = guest_memory_from_file(
-        &params.mem_file_path,
-        &microvm_state.memory_state,
-        track_dirty_pages,
-    )?;
-    builder::build_microvm_from_snapshot(
+    // Add uffd support, but keep it hardcoded off.
+    let uffd_backend = true;
+
+    let mem_file = if uffd_backend {
+        // No memfile used, uffd will provide memory contents.
+        None
+    } else {
+        // Memory contents coming from memfile.
+        Some(File::open(&params.mem_file_path).map_err(MemoryBackingFile)?)
+    };
+    let guest_memory = GuestMemoryMmap::restore(mem_file.as_ref(), mem_state, track_dirty_pages)
+        .map_err(DeserializeMemory)?;
+
+    let mut uffd_backend_desc = None;
+    if uffd_backend {
+        let uffd = UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(true)
+            .create()
+            .expect("uffd creation");
+        let mut backend_mappings = Vec::with_capacity(guest_memory.num_regions());
+
+        for (mem_region, state_region) in guest_memory.iter().zip(mem_state.regions.iter()) {
+            let host_base_addr = mem_region.as_ptr();
+            let size = mem_region.size();
+            info!(
+                "Region base hVA = {:p}, len={:?}; state len={:?}; file offt {:?}",
+                host_base_addr, size, state_region.size, state_region.offset,
+            );
+            uffd.register(host_base_addr as _, size as _)
+                .expect("uffd.register()");
+            info!("done uffd register");
+            backend_mappings.push(RegionBackendMapping {
+                base_h_va: host_base_addr as u64,
+                size,
+                offset: state_region.offset,
+            });
+        }
+
+        uffd_backend_desc = Some(UffdBackendDescription {
+            regions: backend_mappings,
+            uffd,
+        });
+        info!("created uffd backend description");
+
+        // DEBUG
+        // Serve UFFD PFs on another thread in this process.
+        let mem_file_path = params.mem_file_path.clone();
+        std::thread::spawn(move || uffd_handler(uffd_backend_desc.take().unwrap(), mem_file_path));
+    }
+
+    info!("creating vmm");
+    let vmm = builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
@@ -460,7 +628,13 @@ pub fn restore_from_snapshot(
         track_dirty_pages,
         seccomp_filters,
     )
-    .map_err(BuildMicroVm)
+    // .map_err(BuildMicroVm)?;
+    .map_err(|e| {
+        info!("build from snap err");
+        BuildMicroVm(e)
+    })?;
+    info!("ok build from snap");
+    Ok((vmm, None))
 }
 
 fn snapshot_state_from_file(
@@ -474,16 +648,6 @@ fn snapshot_state_from_file(
         .map_err(|e| SnapshotBackingFile("metadata retrieval", e))?;
     let snapshot_len = metadata.len() as usize;
     Snapshot::load(&mut snapshot_reader, snapshot_len, version_map).map_err(DeserializeMicrovmState)
-}
-
-fn guest_memory_from_file(
-    mem_file_path: &Path,
-    mem_state: &GuestMemoryState,
-    track_dirty_pages: bool,
-) -> std::result::Result<GuestMemoryMmap, LoadSnapshotError> {
-    use self::LoadSnapshotError::{DeserializeMemory, MemoryBackingFile};
-    let mem_file = File::open(mem_file_path).map_err(MemoryBackingFile)?;
-    GuestMemoryMmap::restore(&mem_file, mem_state, track_dirty_pages).map_err(DeserializeMemory)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -564,7 +728,6 @@ mod tests {
             guest_mac: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
-            allow_mmds_requests: true,
         };
         insert_net_device(
             &mut vmm,

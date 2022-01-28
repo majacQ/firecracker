@@ -5,7 +5,11 @@ use std::io::Error as IOError;
 use std::os::unix::io::RawFd;
 use std::result::Result;
 
+  <<<<<<< feature/io_uring
 use vm_memory::{mmap::MmapRegionError, MmapRegion};
+  =======
+use vm_memory::{MmapRegion, MmapRegionError};
+  >>>>>>> main
 
 #[derive(Debug)]
 pub enum Error {

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests ensuring codebase style compliance for Rust."""
 
-import framework.utils as utils
+from framework import utils
 
 
 def test_rust_style():
@@ -13,7 +13,8 @@ def test_rust_style():
     """
     # Check that the output is empty.
     _, stdout, _ = utils.run_cmd(
-        'cargo fmt --all -- --check')
+        'cargo fmt --all -- --check '
+        '--config format_code_in_doc_comments=true')
 
     # rustfmt prepends `"Diff in"` to the reported output.
     assert "Diff in" not in stdout
@@ -50,9 +51,13 @@ def test_ensure_mod_tests():
     stdout = result.stdout.strip()
 
     error_msg = (
-        'Tests found in files without a "tests" module:\n {}'
+        f'Tests found in files without a "tests" module:\n {stdout} '
         'To ensure code coverage is reported correctly, please check that '
+  <<<<<<< feature/io_uring
         'your tests are in a module named "tests".'.format(stdout)
+  =======
+        'your tests are in a module named "tests".'
+  >>>>>>> main
     )
 
     assert not stdout, error_msg

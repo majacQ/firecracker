@@ -1,0 +1,18 @@
+[package]
+name = "uffd-daemon"
+version = "0.26.0"
+authors = ["Amazon Firecracker team <firecracker-devel@amazon.com>"]
+edition = "2018"
+description = "bla"
+homepage = "https://firecracker-microvm.github.io/"
+license = "Apache-2.0"
+
+[dependencies]
+libc = ">=0.2.39"
+regex = ">=1.0.0"
+
+vmm-sys-util = "0.9.0"
+
+micro_http = { git = "https://github.com/acatangiu/micro-http", branch = "respond-with-ancillary" }
+utils = { path = "../utils" }
+

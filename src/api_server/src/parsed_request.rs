@@ -25,6 +25,7 @@ use crate::ApiServer;
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
 
 use logger::{error, info};
+use std::os::unix::io::IntoRawFd;
 use vmm::rpc_interface::{VmmAction, VmmActionError};
 
 pub(crate) enum RequestAction {
@@ -138,7 +139,7 @@ impl ParsedRequest {
         }
     }
 
-    fn success_response_with_data<T>(body_data: &T) -> Response
+    pub(crate) fn success_response_with_data<T>(body_data: &T) -> Response
     where
         T: ?Sized + Serialize,
     {
@@ -149,7 +150,7 @@ impl ParsedRequest {
     }
 
     pub(crate) fn convert_to_response(
-        request_outcome: &std::result::Result<VmmData, VmmActionError>,
+        request_outcome: std::result::Result<VmmData, VmmActionError>,
     ) -> Response {
         match request_outcome {
             Ok(vmm_data) => match vmm_data {
@@ -158,17 +159,38 @@ impl ParsedRequest {
                     Response::new(Version::Http11, StatusCode::NoContent)
                 }
                 VmmData::MachineConfiguration(vm_config) => {
-                    Self::success_response_with_data(vm_config)
+                    Self::success_response_with_data(&vm_config)
                 }
                 VmmData::BalloonConfig(balloon_config) => {
-                    Self::success_response_with_data(balloon_config)
+                    Self::success_response_with_data(&balloon_config)
                 }
+                VmmData::BalloonStats(stats) => Self::success_response_with_data(&stats),
+                VmmData::InstanceInformation(info) => Self::success_response_with_data(&info),
+                VmmData::FullVmConfig(config) => Self::success_response_with_data(&config),
+                VmmData::UffdBackendDescription(desc) => {
+                    info!("API responding with uufd backend description");
+                    // FIXME: "201 Created" http response code is better than "200 OK" here.
+                    let mut resp = Self::success_response_with_data(&desc);
+                    // TODO: we're leaking the FD here in firecracker process; but we leak it to
+                    // keep it open until the other end takes ownership of a copy.
+                    // To not leak it, we'd have to introduce another signal between the two
+                    // processes so we know when it's ok to drop.
+                    // All the extra complexity is not worth the effort in firecracker case, it's
+                    // ok to just keep this one FD open/leaked until end of process.
+                    // TODO: we could try to send `File` to microhttp and drop it after `sendmsg`.
+                    // resp.file = desc.uffd.map(|inner| inner.into_raw_fd());
+                    resp.file = Some(desc.uffd.into_raw_fd());
+                    resp
+                }
+  <<<<<<< feature/uffd-on-snaps-response
+  =======
                 VmmData::BalloonStats(stats) => Self::success_response_with_data(stats),
                 VmmData::InstanceInformation(info) => Self::success_response_with_data(info),
                 VmmData::VmmVersion(version) => Self::success_response_with_data(
                     &serde_json::json!({ "firecracker_version": version.as_str() }),
                 ),
                 VmmData::FullVmConfig(config) => Self::success_response_with_data(config),
+  >>>>>>> main
             },
             Err(vmm_action_error) => {
                 error!(
@@ -337,6 +359,7 @@ pub(crate) mod tests {
                 (RequestAction::PatchMMDS(ref val), RequestAction::PatchMMDS(ref other_val)) => {
                     val == other_val
                 }
+
                 _ => false,
             }
         }
@@ -787,8 +810,7 @@ pub(crate) mod tests {
         let mut connection = HttpConnection::new(receiver);
         let body = "{ \
             \"vcpu_count\": 0, \
-            \"mem_size_mib\": 0, \
-            \"ht_enabled\": true \
+            \"mem_size_mib\": 0 \
         }";
         sender
             .write_all(http_request("PUT", "/machine-config", Some(&body)).as_bytes())
@@ -817,15 +839,30 @@ pub(crate) mod tests {
     fn test_try_from_put_mmds() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
         let mut connection = HttpConnection::new(receiver);
+
+        // `/mmds`
         sender
             .write_all(http_request("PUT", "/mmds", Some(&"{}")).as_bytes())
             .unwrap();
         assert!(connection.try_read().is_ok());
         let req = connection.pop_parsed_request().unwrap();
         assert!(ParsedRequest::try_from_request(&req).is_ok());
-        let body = "{\"ipv4_address\":\"169.254.170.2\"}";
+
+        let body = "{\"foo\":\"bar\"}";
         sender
             .write_all(http_request("PUT", "/mmds", Some(&body)).as_bytes())
+            .unwrap();
+        assert!(connection.try_read().is_ok());
+        let req = connection.pop_parsed_request().unwrap();
+        assert!(ParsedRequest::try_from_request(&req).is_ok());
+
+        // `/mmds/config`
+        let body = "{ \
+            \"ipv4_address\": \"169.254.170.2\", \
+            \"network_interfaces\": [\"iface0\"] \
+        }";
+        sender
+            .write_all(http_request("PUT", "/mmds/config", Some(&body)).as_bytes())
             .unwrap();
         assert!(connection.try_read().is_ok());
         let req = connection.pop_parsed_request().unwrap();
@@ -840,7 +877,6 @@ pub(crate) mod tests {
             \"iface_id\": \"string\", \
             \"guest_mac\": \"12:34:56:78:9a:BC\", \
             \"host_dev_name\": \"string\", \
-            \"allow_mmds_requests\": true, \
             \"rx_rate_limiter\": { \
                 \"bandwidth\": { \
                     \"size\": 0, \
@@ -994,8 +1030,7 @@ pub(crate) mod tests {
         let mut connection = HttpConnection::new(receiver);
         let body = "{ \
             \"vcpu_count\": 0, \
-            \"mem_size_mib\": 0, \
-            \"ht_enabled\": true \
+            \"mem_size_mib\": 0 \
         }";
         sender
             .write_all(http_request("PATCH", "/machine-config", Some(&body)).as_bytes())
@@ -1006,7 +1041,7 @@ pub(crate) mod tests {
         let body = "{ \
             \"vcpu_count\": 0, \
             \"mem_size_mib\": 0, \
-            \"ht_enabled\": true, \
+            \"smt\": false, \
             \"cpu_template\": \"C3\" \
         }";
         sender
